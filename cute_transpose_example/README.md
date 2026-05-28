@@ -287,7 +287,7 @@ SShift表示一种permute会被重复多少次，我们不需要重复的pattern
 
 看一下Swizzle后的布局
 
-![image](assets/resources/vSjLYuW51LAYfJqBmxA_bSckulMlBUl2TJrfIJiC24w.png)
+![](Swizzle<6,0,6>_64x64.png)
 
 ### bank conflict free证明
 
