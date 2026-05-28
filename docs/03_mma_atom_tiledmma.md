@@ -18,29 +18,29 @@ MMA op -> MMA atom trait -> tiled MMA -> per-lane fragments -> cute.gemm
 
 CuTe DSL 侧：
 
-- `/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute/atom.py`
+- `cutlass/python/CuTeDSL/cutlass/cute/atom.py`
   - `MmaAtom`
   - `TiledMma`
   - `ThrMma`
   - `make_mma_atom`
   - `make_tiled_mma`
-- `/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute/algorithm.py`
+- `cutlass/python/CuTeDSL/cutlass/cute/algorithm.py`
   - `gemm`
-- `/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute/nvgpu/common.py`
+- `cutlass/python/CuTeDSL/cutlass/cute/nvgpu/common.py`
   - `MmaUniversalOp`
-- `/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute/nvgpu/warp/mma.py`
+- `cutlass/python/CuTeDSL/cutlass/cute/nvgpu/warp/mma.py`
   - `MmaF16BF16Op`
 
 CuTe C++ 侧：
 
-- `/root/lizhiyuan/cutlass/include/cute/atom/mma_atom.hpp`
+- `cutlass/include/cute/atom/mma_atom.hpp`
   - `MMA_Atom`
   - `TiledMMA`
   - `ThrMMA`
   - `make_tiled_mma`
-- `/root/lizhiyuan/cutlass/include/cute/atom/mma_traits_sm80.hpp`
+- `cutlass/include/cute/atom/mma_traits_sm80.hpp`
   - `MMA_Traits<SM80_16x8x8_...>`
-- `/root/lizhiyuan/cutlass/include/cute/arch/mma_sm80.hpp`
+- `cutlass/include/cute/arch/mma_sm80.hpp`
   - `SM80_16x8x8_F32F16F16F32_TN`
 
 ## MMA 的三层抽象
