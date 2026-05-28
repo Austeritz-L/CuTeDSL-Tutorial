@@ -495,3 +495,128 @@ expected_phase_bit: 1
 ```
  
 
+# 第五阶段 加入多轮流水
+warp被分为producer与consumer,producer负责发起TMA搬运，consumer负责转置copy到Gmem
+
+**具体流程为**：
+producer等consumer的barrier -> producer发起TMA
+consumer等producer的barrier -> consumer开始copy
+### Smem struct改动
+加入Stage作为模板常量
+```plain
+template <class TypeA,
+          class SmemLayout, // full layout, e.g. (64,32,3)
+          class StageLayout, // one-stage layout, e.g. (64,32)
+          class StageLayout_T,
+          int Stages>
+```
+加入consumer的barrier
+```plain
+    alignas(16) cute::uint64_t tma_barrier[Stages]; // porducer barrier
+    alignas(16) cute::uint64_t free_barrier[Stages]; // consumer barrier
+```
+加入辅助切割stage的区域与转换layout函数
+```plain
+    CUTE_DEVICE constexpr auto smem_ptr_stage(int s) {
+        TypeA* ptr = A.begin() + s * cute::cosize_v<StageLayout>;
+        return make_smem_ptr(ptr);
+    }
+
+    template <class SmemPtr>
+    CUTE_DEVICE constexpr auto tensor_sA_stage_from_ptr(SmemPtr ptr) {
+        return make_tensor(ptr, StageLayout{});
+    }
+
+    template <class SmemPtr>
+    CUTE_DEVICE constexpr auto tensor_sA_stage_T_from_ptr(SmemPtr ptr) {
+        return make_tensor(ptr, StageLayout_T{});
+    }
+```
+### Device kernel改动
+使用一个线程初始化producer barrier与consumer barrier
+tma_barrier表示这块区域是否被tma写完，可以安全读取
+free_barrier表示这块区域是否被consumer搬运完，可以安全写入
+**注意这里free_barrier一开始应该为可以安全写入状态，所以需要arrive一次**
+```plain
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < Stages; ++s) {
+            initialize_barrier(shared_storage.tma_barrier[s], 1);
+            initialize_barrier(shared_storage.free_barrier[s], 1);
+            arrive_barrier(shared_storage.free_barrier[s]); // initial free
+        }
+    }
+```
+初始化phase bit作为等待barrier的条件
+cache smem的各个区域的ptr到Reg
+```plain
+    using SmemPtr = decltype(shared_storage.smem_ptr_stage(0));
+    SmemPtr smem_ptrs[Stages];
+    int phase_bits[Stages];
+    #pragma unroll
+    for (int i=0; i<Stages; i++) {
+        smem_ptrs[i] = shared_storage.smem_ptr_stage(i);
+        phase_bits[i] = 0;
+    }
+```
+producer & consumer分割
+```plain
+bool is_producer = warp_id < (warp_num / 2);
+```
+##### producer 分支
+构建TMA读取写入块与搬运数据量
+```plain
+                Tensor sA_stage = shared_storage.tensor_sA_stage_from_ptr(smem_ptrs[producer_stage]);
+                Tensor gA_stage = gA(_, _, i);
+                auto [tAgA, tAsA] = tma_partition(
+                    tma_atom_A,
+                    Int<0>{}, Layout<_1>{},
+                    group_modes<0,2>(sA_stage),
+                    group_modes<0,2>(gA_stage)
+                );
+                int tma_transaction_bytes = int(size(tAsA)) * sizeof(TypeA);
+```
+等待本块Smem已经被consumer读取完毕，等待完成后翻转bit作为下一轮等待标准
+```plain
+                wait_barrier(
+                    shared_storage.free_barrier[producer_stage],
+                    phase_bits[producer_stage]
+                );
+                phase_bits[producer_stage] ^= 1;
+```
+发起TMA搬运，并进入下一轮
+```plain
+                set_barrier_transaction_bytes(shared_storage.tma_barrier[producer_stage], tma_transaction_bytes);
+                copy(tma_atom_A.with(shared_storage.tma_barrier[producer_stage]),
+                    tAgA,
+                    tAsA
+                );
+                producer_stage++;
+```
+##### consumer 分支
+一个线程等待tma barrier
+```plain
+            if (consumer_tid == 0) {
+                wait_barrier(
+                    shared_storage.tma_barrier[consumer_stage],
+                    phase_bits[consumer_stage]
+                );
+                phase_bits[consumer_stage] ^= 1;
+            }
+            asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(64) : "memory");
+```
+等待完成后开始搬运
+```plain
+            Tensor sA_T_stage = shared_storage.tensor_sA_stage_T_from_ptr(smem_ptrs[consumer_stage]);
+            Tensor gB_stage = gB(_, _, i);
+            Tensor thr_tile_gB_stage = local_partition(gB_stage, thread_layoutB, consumer_tid);
+            Tensor thr_tile_sA_T_stage = local_partition(sA_T_stage, thread_layoutB, consumer_tid);
+            copy(thr_tile_sA_T_stage, thr_tile_gB_stage);
+```
+搬运后同步并释放barrier
+```plain
+            asm volatile("bar.sync %0, %1;" :: "r"(1), "r"(64) : "memory");
+            if (consumer_tid == 0) {
+                arrive_barrier(shared_storage.free_barrier[consumer_stage]);
+            }
+```
