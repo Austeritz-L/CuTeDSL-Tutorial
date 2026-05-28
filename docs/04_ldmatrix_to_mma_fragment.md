@@ -35,9 +35,9 @@ cute.copy(tiled_s2r_B, tCsB_copy_view, tCrB_copy_view)
 
 CuTe DSL 侧：
 
-- `/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute/nvgpu/warp/copy.py`
+- `cutlass/python/CuTeDSL/cutlass/cute/nvgpu/warp/copy.py`
   - `LdMatrix8x8x16bOp`
-- `/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute/atom.py`
+- `cutlass/python/CuTeDSL/cutlass/cute/atom.py`
   - `make_tiled_copy_A`
   - `make_tiled_copy_B`
   - `ThrCopy.partition_S`
@@ -45,13 +45,13 @@ CuTe DSL 侧：
 
 CuTe C++ 侧：
 
-- `/root/lizhiyuan/cutlass/include/cute/arch/copy_sm75.hpp`
+- `cutlass/include/cute/arch/copy_sm75.hpp`
   - `SM75_U32x1_LDSM_N`
   - `SM75_U32x2_LDSM_N`
   - `SM75_U32x4_LDSM_N`
-- `/root/lizhiyuan/cutlass/include/cute/atom/copy_traits_sm75.hpp`
+- `cutlass/include/cute/atom/copy_traits_sm75.hpp`
   - `Copy_Traits<SM75_U32x*_LDSM_N>`
-- `/root/lizhiyuan/cutlass/include/cute/atom/copy_atom.hpp`
+- `cutlass/include/cute/atom/copy_atom.hpp`
   - `TiledCopy::tidfrg_S`
   - `TiledCopy::retile`
   - `make_tiled_copy_A/B`
