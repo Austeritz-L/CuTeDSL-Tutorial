@@ -26,6 +26,16 @@ The main questions I want to explore are:
 
 ## Main Topics
 
+### 0. Source-Level Notes
+
+The `docs/` directory contains source-level notes for understanding CuTe DSL internals:
+
+- Layout and tensor views
+- Copy atoms and tiled copy
+- MMA atoms and tiled MMA
+- `ldmatrix` to Tensor Core fragment mapping
+- Walkthroughs of the tutorial GEMM kernels
+
 ### 1. CuTe DSL Basics
 
 The first part of this project focuses on the basic abstractions of CuTe DSL:
