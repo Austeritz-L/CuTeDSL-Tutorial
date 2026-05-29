@@ -37,7 +37,6 @@ class NaiveTensorOpGemm:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
-        debug: cutlass.Constexpr = True,
         stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
     ):
         mma_op = cute.nvgpu.warp.MmaF16BF16Op(
@@ -49,6 +48,11 @@ class NaiveTensorOpGemm:
         # atom_layout=(1,1,1) means no tiling above the hardware atom:
         # this CTA/warp is exactly one m16n8k8 MMA atom.
         tiled_mma = cute.make_tiled_mma(mma_op, cute.make_layout((1, 1, 1)))
+        print("[DSL INFO] naive tensorop MMA setup:")
+        print(f"[DSL INFO]   cta_tiler      = {self.cta_tiler}")
+        print("[DSL INFO]   mma_inst_shape = (16, 8, 8)")
+        print("[DSL INFO]   atom_layout    = (1, 1, 1)")
+        print(f"[DSL INFO]   tiled_mma      = {tiled_mma}")
 
         grid = (
             cute.ceil_div(mC.shape[0], self.bM),
@@ -56,7 +60,7 @@ class NaiveTensorOpGemm:
             1,
         )
 
-        self.kernel(mA, mB, mC, tiled_mma, debug).launch(
+        self.kernel(mA, mB, mC, tiled_mma).launch(
             grid=grid,
             block=(self.num_threads, 1, 1),
             stream=stream,
@@ -69,7 +73,6 @@ class NaiveTensorOpGemm:
         mB: cute.Tensor,
         mC: cute.Tensor,
         tiled_mma: cute.TiledMma,
-        debug: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
@@ -89,14 +92,11 @@ class NaiveTensorOpGemm:
         tCrC = tiled_mma.make_fragment_C(tCgC)
         tCrC.fill(0.0)
 
-        if debug:
-            if bidx == 0 and bidy == 0 and tidx == 0:
-                cute.printf("=== naive tensorop m16n8k8 debug ===")
-                cute.printf("CTA tile C shape: 16 x 8, K tile: 8, threads: 32")
-                cute.printf("lane {} owns {} C accumulator registers", tidx, cute.size(tCrC))
-                cute.printf("===tCgC and tCrC after initialization===")
-                cute.print_tensor(tCgC)
-                cute.print_tensor(tCrC)
+        print("[DSL INFO] naive tensorop C partition:")
+        print(f"[DSL INFO]   thr_mma = {thr_mma}")
+        print(f"[DSL INFO]   gC      = {gC.type}")
+        print(f"[DSL INFO]   tCgC    = {tCgC.type}")
+        print(f"[DSL INFO]   tCrC    = {tCrC.type}")
 
         copy_A = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
@@ -142,20 +142,15 @@ class NaiveTensorOpGemm:
             cute.copy(copy_A, tCgA, tCrA)
             cute.copy(copy_B, tCgB, tCrB)
 
-            if debug:
-                if bidx == 0 and bidy == 0 and k_tile == 0 and tidx == 0:
-                    cute.printf("===tCgA、tCrA、tCgB、tCrB after copy===")
-                    cute.print_tensor(tCgA)
-                    cute.print_tensor(tCrA)
-                    cute.print_tensor(tCgB)
-                    cute.print_tensor(tCrB)
+            print("[DSL INFO] naive tensorop A/B fragments:")
+            print(f"[DSL INFO]   gA   = {gA.type}")
+            print(f"[DSL INFO]   gB   = {gB.type}")
+            print(f"[DSL INFO]   tCgA = {tCgA.type}")
+            print(f"[DSL INFO]   tCgB = {tCgB.type}")
+            print(f"[DSL INFO]   tCrA = {tCrA.type}")
+            print(f"[DSL INFO]   tCrB = {tCrB.type}")
 
             cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
-
-            if debug:
-                if bidx == 0 and bidy == 0 and k_tile == 0 and tidx == 0:
-                    cute.printf("lane {} C fragment after one mma.sync:", tidx)
-                    cute.print_tensor(tCrC)
 
         cute.copy(copy_C, tCrC, tCgC)
 

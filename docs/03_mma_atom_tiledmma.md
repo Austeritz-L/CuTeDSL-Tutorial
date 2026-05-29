@@ -1,7 +1,8 @@
 # MMA Atom 和 Tiled MMA
 
-这一章解释 CuTe 如何描述矩阵乘法指令，尤其是 Ampere 上的
-`mma.sync.aligned.m16n8k8`。
+这一章解释 CuTe 如何描述矩阵乘法指令，尤其是当前 `ldsm_tensorop.py`
+使用的 Ampere `m16n8k16` Tensor Core atom，以及它如何通过 `TiledMma`
+铺成一个 `128x128x16` CTA tile。
 
 核心链路是：
 
@@ -12,7 +13,7 @@ MMA op -> MMA atom trait -> tiled MMA -> per-lane fragments -> cute.gemm
 在我们的教程里有两种 MMA：
 
 - `MmaUniversalOp(Float32)`：教学用 scalar/universal atom，本质上是普通 FMA 逻辑
-- `warp.MmaF16BF16Op(Float16, Float32, (16,8,8))`：Ampere Tensor Core warp-level MMA
+- `warp.MmaF16BF16Op(Float16, Float32, (16,8,16))`：Ampere Tensor Core warp-level MMA
 
 ## 源码入口
 
@@ -39,9 +40,9 @@ CuTe C++ 侧：
   - `ThrMMA`
   - `make_tiled_mma`
 - `cutlass/include/cute/atom/mma_traits_sm80.hpp`
-  - `MMA_Traits<SM80_16x8x8_...>`
+  - `MMA_Traits<SM80_16x8x16_...>`
 - `cutlass/include/cute/arch/mma_sm80.hpp`
-  - `SM80_16x8x8_F32F16F16F32_TN`
+  - `SM80_16x8x16_F32F16F16F32_TN`
 
 ## MMA 的三层抽象
 
@@ -54,25 +55,32 @@ TiledMma   = 把一个 MMA atom 铺到更大的 MNK tile 上
 ThrMma     = 当前线程在 TiledMma 里的切片
 ```
 
-`MmaAtom` 关心的是一条 atom 级别的 MMA。对 Ampere m16n8k8 来说，atom 就是一条
+`MmaAtom` 关心的是一条 atom 级别的 MMA。对当前 Ampere m16n8k16 来说，atom 就是一条
 warp-level Tensor Core 指令：
 
 ```text
-mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 ```
 
 `TiledMma` 关心的是如果一个 CTA/warp 里有多个 atom，应该怎么把 atom tile 排列到
-更大的 `(M,N,K)` tile 上。我们当前教程故意使用最简单的：
+更大的 `(M,N,K)` tile 上。当前 `ldsm_tensorop.py` 使用：
 
 ```python
-tiled_mma = cute.make_tiled_mma(mma_op, cute.make_layout((1, 1, 1)))
+atom_layout_mnk = (2, 2, 1)
+permutation_mnk = (32, 32, 16)
+tiled_mma = cute.make_tiled_mma(
+    mma_op,
+    cute.make_layout(atom_layout_mnk),
+    permutation_mnk=permutation_mnk,
+)
 ```
 
 这表示：
 
 ```text
-不在 atom 之上再做 tiling
-一个 CTA/warp 正好计算一个 m16n8k8 MMA atom
+每个 CTA 有 2 x 2 x 1 个 warp-level atom group
+每个 group 32 lanes，所以 CTA 使用 128 threads
+TiledMma 再把这些 atom 铺到 128x128x16 的 CTA tile 上
 ```
 
 ## `MmaUniversalOp` 是什么
@@ -115,7 +123,7 @@ Tensor Core 版本里使用：
 mma_op = cute.nvgpu.warp.MmaF16BF16Op(
     cutlass.Float16,
     cutlass.Float32,
-    (16, 8, 8),
+    (16, 8, 16),
 )
 ```
 
@@ -124,7 +132,7 @@ mma_op = cute.nvgpu.warp.MmaF16BF16Op(
 ```text
 A/B dtype      = Float16
 accumulator    = Float32
-instruction    = m16n8k8
+instruction    = m16n8k16
 ```
 
 DSL 源码 `warp/mma.py` 会检查：
@@ -139,25 +147,26 @@ DSL 源码 `warp/mma.py` 会检查：
 MmaAtomSM80Type.get(shape_mnk, ab_dtype, ab_dtype, acc_dtype)
 ```
 
-C++ 最终对应到 `arch/mma_sm80.hpp` 的内联汇编。对我们这个配置来说，对应结构是：
+C++ 最终对应到 `arch/mma_sm80.hpp` 的内联汇编。对当前配置来说，对应结构是
+SM80 m16n8k16 fp16/bf16 Tensor Core op。
 
 ```cpp
-SM80_16x8x8_F32F16F16F32_TN
+SM80_16x8x16_F32F16F16F32_TN
 ```
 
 它的寄存器签名是：
 
 ```cpp
 using DRegisters = float[4];
-using ARegisters = uint32_t[2];
-using BRegisters = uint32_t[1];
+using ARegisters = uint32_t[4];
+using BRegisters = uint32_t[2];
 using CRegisters = float[4];
 ```
 
 最终 PTX 形态是：
 
 ```text
-mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 ```
 
 这就是 Tensor Core 真正进入程序的位置。
@@ -179,10 +188,10 @@ using LayoutA_TV = ...
 using LayoutB_TV = ...
 ```
 
-对 SM80 m16n8k8 fp16 输入、fp32 accumulate：
+对 SM80 m16n8k16 fp16 输入、fp32 accumulate：
 
 ```cpp
-using Shape_MNK = Shape<_16,_8,_8>;
+using Shape_MNK = Shape<_16,_8,_16>;
 using ThrID     = Layout<_32>;
 using ALayout   = SM80_16x8_Row;
 using BLayout   = SM80_8x8_Row;
@@ -204,7 +213,7 @@ LayoutC_TV: (thread, value) -> C(m,n)
 
 ## 为什么每个 lane 有 4 个 C accumulator
 
-`m16n8k8` 的 C tile 是：
+`m16n8k16` 的 C tile 是：
 
 ```text
 16 x 8 = 128 个 C 元素
@@ -227,37 +236,35 @@ using CRegisters = float[4];
 
 完全一致。
 
-在我们的 debug 输出里：
-
-```text
-lane 0 owns 4 C accumulator registers
-```
-
-就是这个原因。
+当前代码用静态 `print(f"... {tCrC.type}")` 打印 fragment type。只看单条
+m16n8k16 atom 时，每个 lane 对应 4 个 fp32 accumulator；在 tiled MMA 中，一个
+lane 可能持有多个 atom group 对应的 accumulator，实际数量以 `tCrC.type` 为准。
 
 ## `make_tiled_mma`
 
-当前代码：
+当前 `ldsm_tensorop.py` 代码：
 
 ```python
-tiled_mma = cute.make_tiled_mma(mma_op, cute.make_layout((1, 1, 1)))
+atom_layout_mnk = (2, 2, 1)
+permutation_mnk = (32, 32, 16)
+tiled_mma = cute.make_tiled_mma(
+    mma_op,
+    cute.make_layout(atom_layout_mnk),
+    permutation_mnk=permutation_mnk,
+)
 ```
 
-`make_layout((1,1,1))` 表示 atom layout MNK：
+`make_layout((2,2,1))` 表示 atom layout MNK：
 
 ```text
-M 方向 1 个 atom
-N 方向 1 个 atom
+M 方向 2 个 atom group
+N 方向 2 个 atom group
 K 方向 1 个 atom
 ```
 
-所以 tile shape 仍然是 atom shape：
-
-```text
-M = 16
-N = 8
-K = 8
-```
+这里的 atom group 不是最终 CTA tile 的全部尺寸。`permutation_mnk=(32,32,16)`
+描述 TiledMMA 如何把 warp-level atom 的线程/value layout 继续铺到更大的 tile。
+最终 `thr_mma.partition_A/B/C` 面向的是 `128x128x16` CTA tile。
 
 C++ `make_tiled_mma` 会把这个 thread layout 扩展成 rank-3 的
 `AtomLayoutMNK`，再构造：
@@ -279,7 +286,8 @@ V: atom 内部的 warp lanes
 M/N/K: atom 在更大 tiled MMA 中沿 M/N/K 的排列
 ```
 
-当前 `(1,1,1)` 的情况最简单：没有额外 M/N/K 方向的 atom replication。
+当前 `(2,2,1)` 的情况意味着一个 CTA 有 4 个 warp group，共 128 个线程参与
+这个 tiled MMA。
 
 ## `get_slice(tidx)`
 
@@ -313,7 +321,7 @@ tCrC = tiled_mma.make_fragment_C(tCgC)
 tCrC.fill(0.0)
 ```
 
-`gC` 是当前 CTA 的 C tile view，形状大约是 `(16,8)`。
+`gC` 是当前 CTA 的 C tile view，逻辑形状是 `(128,128)`。
 
 `partition_C(gC)` 做的是：
 
@@ -338,8 +346,9 @@ return thr_tensor(thr_vmn, make_coord(_, ...));
 
 最后得到当前 lane 的 C view。
 
-`make_fragment_C(tCgC)` 创建真正的 accumulator register tensor。对 fp32 m16n8k8，
-每个 lane 是 4 个 float。
+`make_fragment_C(tCgC)` 创建真正的 accumulator register tensor。由于当前是 tiled
+MMA，每个 lane 会持有多个 m16n8k16 atom 对应的 C fragment，具体 shape 以静态
+`tCrC.type` 打印为准。
 
 ## `partition_A` 和 `partition_B`
 
@@ -424,10 +433,10 @@ All tensors must be partitioned according to the provided MMA Atom.
 - `tCrC` 必须符合 C fragment layout
 
 DSL `cute.gemm` 会把 `tiled_mma` unpack 成底层 trait，然后生成 `_cute_ir.gemm`。
-在 SM80 m16n8k8 这个配置下，后端会降低到：
+在 SM80 m16n8k16 这个配置下，后端会降低到：
 
 ```text
-mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 ```
 
 如果使用 `MmaUniversalOp`，则是 scalar/universal 路径，不是 Tensor Core。
@@ -489,8 +498,8 @@ cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
 看 MMA 代码时先问五个问题：
 
 1. 用的是 universal atom 还是 Tensor Core atom？
-2. MMA atom 的 shape 是多少？比如 `(16,8,8)`
-3. 一个 CTA/warp 里有几个 atom？当前教程是 `(1,1,1)`
+2. MMA atom 的 shape 是多少？当前 `ldsm_tensorop.py` 是 `(16,8,16)`
+3. 一个 CTA 里有几个 atom group？当前 `atom_layout_mnk=(2,2,1)`，共 128 threads
 4. A/B/C tensor 是否经过了 `partition_A/B/C`？
 5. A/B/C register fragment 是否通过 `make_fragment_A/B/C` 创建？
 
@@ -498,21 +507,25 @@ cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
 
 ## 和 TiledMMA 优化的关系
 
-当前教程使用：
+当前 `ldsm_tensorop.py` 已经进入 tiled MMA 阶段：
 
 ```text
-1 CTA = 1 warp = 1 MMA atom
+CTA tile = 128 x 128 x 16
+MMA atom = m16n8k16
+atom_layout_mnk = (2,2,1)
+CTA threads = 2 * 2 * 1 * 32 = 128
 ```
 
-后续优化会变成：
+后续优化会继续保留这个抽象，只是增加：
 
 ```text
-1 CTA = 多个 warp
-1 warp = 多个 MMA atom
-CTA tile = 多个 m16n8k8 atom 拼起来
+cp.async
+多 stage pipeline
+shared memory swizzle
+更完整的 residue predicate
 ```
 
-那时 `make_tiled_mma` 的 atom layout 不再是 `(1,1,1)`。但底层逻辑不变：
+底层逻辑不变：
 
 ```text
 MMA traits 定义单条指令的 fragment layout

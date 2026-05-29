@@ -167,14 +167,26 @@ tCrC: per-lane 的 C accumulator fragment
 tCgC: per-lane 的 C 的 GMEM view
 ```
 
-`ldsm_tensorop.py` 的 GMEM->SMEM 路径使用 `CopyUniversalOp`：
+当前 `ldsm_tensorop.py` 的 GMEM->SMEM 路径使用 `CopyUniversalOp` +
+`make_tiled_copy_tv`：
 
 ```python
-cute.copy(g2S_copy_A, tAgA, tAsA)
-cute.copy(g2S_copy_B, tBgB, tBsB)
+g2S_copy_A = cute.make_copy_atom(
+    cute.nvgpu.CopyUniversalOp(),
+    mA.element_type,
+    num_bits_per_copy=128,
+)
+tiled_g2s_A = cute.make_tiled_copy_tv(g2S_copy_A, thread_layout, value_layout)
+
+thr_g2s_A = tiled_g2s_A.get_slice(tidx)
+tAgA = thr_g2s_A.partition_S(gA)
+tAsA = thr_g2s_A.partition_D(sA)
+cute.copy(tiled_g2s_A, tAgA, tAsA)
 ```
 
-这里每个线程的 source/destination slice 是我们用 `local_partition` 手动构造的。
+这里每个线程的 source/destination slice 不是手写 `local_partition`，而是由
+`TiledCopy` 的 `partition_S/partition_D` 生成。copy atom 仍然是普通
+`CopyUniversalOp`，只是 copy 被组织成 128-bit vectorized tiled copy。
 
 ## `cute.copy` 的源码逻辑
 
@@ -379,12 +391,17 @@ DSL 的 `retile` 会根据 TiledCopy trait 调用底层 IR 做相同类型的重
 
 ## `ldmatrix` 作为 CopyAtom
 
-`LdMatrix8x8x16bOp(False, 2)` 出现在：
+当前 `ldsm_tensorop.py` 使用 m16n8k16 tiled MMA，因此 A/B 的 S2R 都使用
+`LdMatrix8x8x16bOp(False, 4)`：
 
 ```python
 s2R_copy_A = cute.make_copy_atom(
-    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2),
+    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
     mA.element_type,
+)
+s2R_copy_B = cute.make_copy_atom(
+    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
+    mB.element_type,
 )
 ```
 
@@ -392,10 +409,10 @@ s2R_copy_A = cute.make_copy_atom(
 
 ```text
 False -> 不转置，对应 PTX 没有 .trans
-2     -> 一条 ldmatrix.x2，读取两个 8x8 矩阵
+4     -> 一条 ldmatrix.x4，读取四个 8x8 矩阵
 ```
 
-`LdMatrix8x8x16bOp(False, 1)` 对应 `ldmatrix.x1`。
+`LdMatrix8x8x16bOp(False, 1/2/4)` 分别对应 `ldmatrix.x1/x2/x4`。
 
 DSL 源码 `warp/copy.py` 会把它构造成 `CopyAtomLdsmType`：
 
@@ -423,27 +440,32 @@ ldmatrix.sync.aligned.x4.m8n8.shared.b16
 
 ### GMEM -> SMEM
 
-第一段是教学用的简单 copy：
+第一段是 tiled Universal copy：
 
 ```text
-gA/gB -> local_partition -> tAgA/tBgB
-sA/sB -> local_partition -> tAsA/tBsB
-copy universal atom
+gA/gB -> TiledCopy.partition_S -> tAgA/tBgB
+sA/sB -> TiledCopy.partition_D -> tAsA/tBsB
+CopyUniversalOp tiled copy
 ```
 
 代码：
 
 ```python
-tAgA = cute.local_partition(gA, g2s_thr_layout_A, tidx)
-tAsA = cute.local_partition(sA, g2s_thr_layout_A, tidx)
-tBgB = cute.local_partition(gB, g2s_thr_layout_B, tidx)
-tBsB = cute.local_partition(sB, g2s_thr_layout_B, tidx)
+thr_g2s_A = tiled_g2s_A.get_slice(tidx)
+thr_g2s_B = tiled_g2s_B.get_slice(tidx)
 
-cute.copy(g2S_copy_A, tAgA, tAsA)
-cute.copy(g2S_copy_B, tBgB, tBsB)
+tAgA = thr_g2s_A.partition_S(gA)
+tAsA = thr_g2s_A.partition_D(sA)
+tBgB = thr_g2s_B.partition_S(gB)
+tBsB = thr_g2s_B.partition_D(sB)
+
+cute.copy(tiled_g2s_A, tAgA, tAsA)
+cute.copy(tiled_g2s_B, tBgB, tBsB)
 ```
 
-这里我们自己决定 32 个线程怎么分工。
+这里我们通过 `thread_layout/value_layout` 描述 128 个线程如何搬一个
+`128x16` fp16 tile。当前 fp16 下 `copy_elems=8`，每条 Universal copy 搬
+8 个连续 fp16，也就是 128 bit。
 
 ### SMEM -> RMEM
 
@@ -494,9 +516,14 @@ retile 是否用在 MMA register fragment 上
 
 ## 和后续优化的关系
 
-当前 `ldsm_tensorop.py` 还没有做：
+当前 `ldsm_tensorop.py` 已经做了：
 
-- vectorized GMEM->SMEM copy
+- vectorized GMEM->SMEM tiled copy
+- tiled MMA over a `128x128x16` CTA tile
+- ldmatrix.x4 SMEM->RMEM copy
+
+但还没有做：
+
 - `cp.async`
 - 多 stage pipeline
 - swizzle shared memory layout

@@ -135,8 +135,8 @@ c_tensor = from_dlpack(c, assumed_align=16)
 thread_layout = cute.make_layout((self.bM, self.bN), stride=(self.bN, 1))
 sA_layout = cute.make_layout((self.bM, self.bK), stride=(self.bK, 1))
 sB_layout = cute.make_layout((self.bN, self.bK), stride=(self.bK, 1))
-g2s_thr_layout_A = cute.make_layout((self.bM, 2), stride=(2, 1))
-g2s_thr_layout_B = cute.make_layout((self.bN, 4), stride=(4, 1))
+g2s_thread_layout = cute.make_layout((64, 2), stride=(2, 1))
+g2s_value_layout = cute.make_layout((1, 8))
 ```
 
 `make_layout` 的作用就是构造一个坐标到 offset 的函数。
@@ -155,32 +155,45 @@ tid = m * 16 + n
 
 也就是每个线程负责一个 `C[m, n]`。
 
-在 `ldsm_tensorop.py` 里：
+在当前 `ldsm_tensorop.py` 里，GMEM->SMEM 不再手写 `local_partition`
+线程布局，而是用 `make_tiled_copy_tv` 构造 tiled copy：
 
 ```python
-g2s_thr_layout_A = cute.make_layout((self.bM, 2), stride=(2, 1))
-g2s_thr_layout_B = cute.make_layout((self.bN, 4), stride=(4, 1))
+thread_layout = cute.make_layout(
+    (self.num_threads // shape_dim_1, shape_dim_1),
+    stride=(shape_dim_1, 1),
+)
+value_layout = cute.make_layout((1, copy_elems))
+tiled_g2s_A = cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
 ```
 
-对固定的 m16n8k8 Tensor Core kernel：
+当前配置是：
 
 ```text
-A tile = 16 x 8 = 128 个 fp16
-B tile =  8 x 8 =  64 个 fp16
-CTA     = 32 threads
+CTA tile = (128, 128, 16)
+dtype    = fp16
+copy     = 128-bit Universal copy
+copy_elems = 128 / 16 = 8 fp16
+threads  = 128
 ```
 
-`g2s_thr_layout_A = (16,2):(2,1)` 的 size 是 32，所以它可以覆盖 32 个线程。
-目标 A tile 还有一个 K 维度没有被线程 layout 完全消耗，所以每个线程最终拿到
-4 个 fp16。
+因为 `bK = 16`，所以：
 
-`g2s_thr_layout_B = (8,4):(4,1)` 的 size 也是 32，每个线程最终拿到 2 个 fp16。
+```text
+shape_dim_1 = bK / copy_elems = 16 / 8 = 2
+thread_layout = (64, 2):(2, 1)
+value_layout  = (1, 8):(8, 1)
+```
+
+这表示 G2S tiled copy 把一个 `128x16` 的 A/B tile 分给 128 个线程，
+每个 copy atom 搬 8 个连续 fp16，也就是 16B。
 
 这里要区分两个概念：
 
 ```text
 thread layout 的元素数 = 线程数
-每个线程实际 copy 的元素数 = target tensor 被 local_partition 后剩下的 slice 大小
+value layout 描述每条 copy 指令搬多少连续元素
+tiled copy 把 thread layout 和 value layout 组合成 (thread,value)->tile 坐标
 ```
 
 ## `local_tile`
@@ -417,18 +430,22 @@ for k in range(bK):
     tCrC[0] += tCrA[k] * tCrB[k]
 ```
 
-### GMEM 到 SMEM 的 copy partition
+### GMEM 到 SMEM 的 tiled copy partition
 
 在 `ldsm_tensorop.py` 里：
 
 ```python
-tAgA = cute.local_partition(gA, g2s_thr_layout_A, tidx)
-tAsA = cute.local_partition(sA, g2s_thr_layout_A, tidx)
-tBgB = cute.local_partition(gB, g2s_thr_layout_B, tidx)
-tBsB = cute.local_partition(sB, g2s_thr_layout_B, tidx)
+thr_g2s_A = tiled_g2s_A.get_slice(tidx)
+thr_g2s_B = tiled_g2s_B.get_slice(tidx)
+
+tAgA = thr_g2s_A.partition_S(gA)
+tAsA = thr_g2s_A.partition_D(sA)
+tBgB = thr_g2s_B.partition_S(gB)
+tBsB = thr_g2s_B.partition_D(sB)
 ```
 
-这里对 source 和 destination 使用同一个 thread layout：
+这里 source 和 destination 使用同一个 TiledCopy 的 source/destination
+partition 规则：
 
 ```text
 tAgA: 当前线程负责的 A 的 GMEM slice
@@ -440,11 +457,13 @@ tBsB: 当前线程负责的 B 的 SMEM slice
 所以后面可以直接：
 
 ```python
-cute.copy(g2S_copy_A, tAgA, tAsA)
-cute.copy(g2S_copy_B, tBgB, tBsB)
+cute.copy(tiled_g2s_A, tAgA, tAsA)
+cute.copy(tiled_g2s_B, tBgB, tBsB)
 ```
 
-这一步仍然是最基础的 atom copy，没有使用 tiled copy。
+这一步已经是 tiled copy，但 copy atom 仍然是 `CopyUniversalOp`。
+也就是说，G2S 仍然是普通 global/shared memory load-store，不是 `cp.async`；
+只是线程和值的分配由 TiledCopy 负责。
 
 ## `make_fragment_like`
 
@@ -515,7 +534,10 @@ tCsB = thr_mma.partition_B(sB)
 用 (16,16):(16,1) 把 256 个线程映射到 16x16 C tile
 ```
 
-但是 `partition_A/B/C` 是 MMA atom 根据硬件指令的 fragment contract 生成的per-lane view。对 `mma.sync.aligned.m16n8k8` 来说，每个 lane 必须持有规定位置的A/B/C 寄存器。这个 layout 不是随便设计的，而是由 PTX 指令语义决定。
+但是 `partition_A/B/C` 是 MMA atom 根据硬件指令的 fragment contract 生成的
+per-lane view。当前 `ldsm_tensorop.py` 使用 tiled m16n8k16 Tensor Core atom；
+每个 lane 必须持有规定位置的 A/B/C 寄存器。这个 layout 不是随便设计的，而是由
+PTX 指令语义决定。
 
 这一章只需要记住：
 
@@ -526,25 +548,19 @@ thr_mma.partition_*  = MMA atom 提供 per-lane fragment 布局
 
 `partition_A/B/C` 的源码和 PTX 对应关系放到 `03_mma_atom_tiledmma.md` 里展开。
 
-## 静态打印和运行时打印
+## 静态 shape 打印
 
-代码里有两类打印：
+当前教程代码默认只保留静态打印：
 
 ```python
 print(f"[DSL INFO] tAgA = {tAgA.type}")
 ```
 
-以及：
-
-```python
-cute.print_tensor(tCrA)
-```
-
-它们不是一回事。
-
 Python `print(...)` 是 JIT tracing 阶段的静态打印。它发生在 DSL 构造 IR 的时候，适合看 `tensor.type`、layout、shape、memory space 等编译期信息。因为 `for k_tile`这类循环在 JIT 里可能是符号化构造，所以静态打印经常只出现一次。
 
-`cute.printf` 和 `cute.print_tensor` 是 device 运行时打印。它们发生在生成出来的 CUDA kernel 里面。`cute.print_tensor` 可能真的去解引用 tensor view，所以打印 GMEM view 时如果坐标不对，可能触发越界访问。调试 layout 时建议先看 `.type`，确认 view 形状和 memory space 后，再用 `cute.print_tensor` 打小的、受 guard 保护的 fragment。
+当前教程代码默认只保留静态打印，也就是只打印 `.type`、layout、shape 和 memory
+space。device 运行时打印会真实执行在 CUDA kernel 里，并且可能解引用 tensor view。
+为了让读者专注于形状推导，当前版本不再使用运行时打印。
 
 ## API 总结
 
@@ -558,10 +574,11 @@ Python `print(...)` 是 JIT tracing 阶段的静态打印。它发生在 DSL 构
 | `cute.make_layout` | 构造坐标映射 | thread layout、SMEM layout |
 | `cute.local_tile` | 取 CTA tile | 构造 `gA`、`gB`、`gC` |
 | `proj` | 投影掉不用的 mode | 用 `(M,N,K)` tiler 描述 A/B/C |
-| `cute.local_partition` | 取当前线程的 slice | SIMT 计算、GMEM->SMEM copy |
+| `cute.local_partition` | 取当前线程的 slice | scalar/SIMT 教学 kernel |
+| `cute.make_tiled_copy_tv` | 用 thread/value layout 构造 tiled copy | 当前 `ldsm_tensorop.py` 的 G2S |
+| `ThrCopy.partition_S/D` | 按 TiledCopy 切 source/destination | 当前 `ldsm_tensorop.py` 的 G2S/S2R |
 | `cute.make_fragment_like` | 构造匹配 view 的 RMEM fragment | scalar SGEMM |
-| `cute.size` | 获取 tensor/layout 的逻辑元素数 | debug 和 scalar loop |
-| `cute.print_tensor` | 运行时打印 tensor 值 | debug |
+| `cute.size` | 获取 tensor/layout 的逻辑元素数 | 静态 shape 推导和 scalar loop |
 | `thr_mma.partition_A/B/C` | MMA per-lane view | TensorOp kernel |
 | `SmemAllocator.allocate_tensor` | 按 layout 分配 shared memory tensor | ldmatrix kernel |
 
@@ -592,13 +609,15 @@ CTA tile -> MMA per-lane partition -> register fragment
 
 ### `ldsm_tensorop.py`
 
-这个版本多了一段 shared memory：
+当前这个版本把 CTA tile 扩展到 `(128,128,16)`，并使用 tiled copy/tiled MMA：
 
 ```text
-GMEM CTA tile -> per-thread GMEM slice -> per-thread SMEM slice
+GMEM CTA tile -> TiledCopy G2S partition -> SMEM tile
 SMEM tensor   -> ldmatrix copy view     -> MMA register fragment
 ```
 
-GMEM 到 SMEM 这一步仍然只需要 `make_layout` 和 `local_partition` 就能解释清楚。
-SMEM 到 RMEM 这一步涉及 `make_tiled_copy_A/B`、`partition_S`、`retile` 和
-`LdMatrix8x8x16bOp`，它们属于 copy atom/tiled copy 的内容，后面单独展开。
+GMEM 到 SMEM 这一步使用 `CopyUniversalOp` + `make_tiled_copy_tv`，每条 copy 是
+128-bit vectorized Universal copy。SMEM 到 RMEM 使用 `LdMatrix8x8x16bOp(False, 4)`
++ `make_tiled_copy_A/B`，并通过 `retile` 把 ldmatrix 的 destination view 对齐到
+MMA register fragment。计算阶段使用 tiled m16n8k16 Tensor Core atom 拼出
+`128x128` 的 CTA 结果 tile。

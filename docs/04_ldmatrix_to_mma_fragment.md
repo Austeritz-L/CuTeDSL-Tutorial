@@ -10,11 +10,11 @@ GMEM -> SMEM -> ldmatrix -> RMEM fragment -> mma.sync
 
 ```python
 s2R_copy_A = cute.make_copy_atom(
-    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2),
+    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
     mA.element_type,
 )
 s2R_copy_B = cute.make_copy_atom(
-    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 1),
+    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
     mB.element_type,
 )
 tiled_s2r_A = cute.make_tiled_copy_A(s2R_copy_A, tiled_mma)
@@ -81,7 +81,7 @@ ldmatrix.sync.aligned.x4.m8n8.shared.b16
 CuTe DSL 的：
 
 ```python
-LdMatrix8x8x16bOp(False, 2)
+LdMatrix8x8x16bOp(False, 4)
 ```
 
 可以读成：
@@ -89,10 +89,10 @@ LdMatrix8x8x16bOp(False, 2)
 ```text
 ldmatrix.m8n8.shared.b16
 不转置
-一次加载 2 个 8x8 矩阵
+一次加载 4 个 8x8 矩阵
 ```
 
-也就是 PTX 的 `.x2` 形式。
+也就是 PTX 的 `.x4` 形式。
 
 ## DSL 到 C++/PTX 的对应
 
@@ -133,18 +133,19 @@ SM75_U32x4_LDSM_N -> ldmatrix.sync.aligned.x4.m8n8.shared.b16
 
 `_N` 表示 non-transpose。转置版本会走 `.trans` 形式。
 
-## 为什么 A 用 `.x2`
+## 为什么当前 A/B 都用 `.x4`
 
-我们的 MMA 是：
+当前 `ldsm_tensorop.py` 的 MMA atom 是：
 
 ```text
-mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 ```
 
-A operand 的 logical tile 是：
+单条 m16n8k16 atom 的 logical operand tile 是：
 
 ```text
-A: M x K = 16 x 8
+A: M x K = 16 x 16
+B: N x K =  8 x 16
 ```
 
 一个 `ldmatrix.m8n8` 的基础矩阵是：
@@ -153,53 +154,27 @@ A: M x K = 16 x 8
 8 x 8
 ```
 
-所以 A 的 16x8 可以看成两个 8x8 叠在 M 方向：
-
-```text
-A(16,8) = A0(8,8) + A1(8,8)
-```
-
-因此 A 用：
-
-```python
-LdMatrix8x8x16bOp(False, 2)
-```
-
-即 `.x2`。
-
-对应代码：
+如果只看一条 atom，A 可以拆成 4 个 8x8 半精度矩阵块，B 可以拆成 2 个 8x8
+矩阵块。当前代码使用 `TiledMMA` 把多个 atom group 铺成 `128x128x16` CTA tile，
+再用 `make_tiled_copy_A/B` 将 ldmatrix 的 destination layout 对齐到 tiled MMA 的
+A/B fragment layout。为了让每次 S2R 装载覆盖当前 tiled fragment 的向量化形状，
+A 和 B 都采用 `.x4`：
 
 ```python
 s2R_copy_A = cute.make_copy_atom(
-    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2),
+    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
     mA.element_type,
 )
-```
-
-## 为什么 B 用 `.x1`
-
-B operand 的 logical tile 是：
-
-```text
-B: N x K = 8 x 8
-```
-
-它正好就是一个 8x8 matrix，所以 B 用：
-
-```python
-LdMatrix8x8x16bOp(False, 1)
-```
-
-即 `.x1`。
-
-对应代码：
-
-```python
 s2R_copy_B = cute.make_copy_atom(
-    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 1),
+    cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4),
     mB.element_type,
 )
 ```
+
+这里不要把 `.x4` 简单理解成“单条 atom 的 B 必须有 4 个 8x8”。真正需要匹配的是
+`make_tiled_copy_B(s2R_copy_B, tiled_mma)` 生成的 copy TV layout 和 `tCrB` 的 tiled
+register fragment layout。当前版本的静态打印会显示 `tCsB_copy_view` 和
+`tCrB_copy_view` 的 shape，用它们检查 S2R copy 是否和 MMA fragment 对齐。
 
 ## 为什么不用手写 lane 到地址的映射
 
@@ -207,10 +182,10 @@ PTX 文档会描述每个 lane 提供哪些 shared memory 地址，以及每个 
 register。直接手写这套映射很容易出错。
 
 CuTe 的做法是把这个映射编码进 CopyAtom traits。C++ 的
-`copy_traits_sm75.hpp` 里，例如 `.x2`：
+`copy_traits_sm75.hpp` 里，例如 `.x4`：
 
 ```cpp
-Copy_Traits<SM75_U32x2_LDSM_N>
+Copy_Traits<SM75_U32x4_LDSM_N>
   ThrID     = Layout<_32>
   SrcLayout = ...
   DstLayout = ...
@@ -417,8 +392,8 @@ B 同理。
 当前教程使用：
 
 ```python
-sA_layout = cute.make_layout((16, 8), stride=(8, 1))
-sB_layout = cute.make_layout((8, 8), stride=(8, 1))
+sA_layout = cute.make_layout((128, 16), stride=(16, 1))
+sB_layout = cute.make_layout((128, 16), stride=(16, 1))
 ```
 
 这非常直观：
@@ -470,16 +445,15 @@ MMA fragment retile 的 layout
 
 `ldsm_tensorop.py` 是教学 kernel，不是最终高性能 kernel。它还没有：
 
-- vectorized GMEM->SMEM copy
 - `cp.async`
 - double buffering / multi-stage pipeline
 - swizzled shared memory layout
-- 多 warp / 多 MMA atom 的 CTA tile
+- 更完整的 residue predicate
 
 但它已经具备 Tensor Core 主循环的核心结构：
 
 ```text
-load A/B tile to SMEM
+vectorized G2S tiled copy 把 A/B tile load 到 SMEM
 sync
 ldmatrix to registers
 mma.sync
@@ -497,15 +471,8 @@ print(f"tCsA_copy_view = {tCsA_copy_view.type}")
 print(f"tCrA_copy_view = {tCrA_copy_view.type}")
 ```
 
-再谨慎使用：
-
-```python
-cute.print_tensor(tCrA)
-cute.print_tensor(tCrB)
-```
-
-不要随便对 GMEM view 做 `cute.print_tensor`，因为它会真实解引用，有机会暴露或者
-触发越界访问。
+当前版本默认只保留这种静态打印。它发生在 JIT tracing/编译阶段，只展示
+tensor/layout shape，不会在 GPU 上解引用数据，也不会因为打印 GMEM view 触发越界。
 
 ## 一句话总结
 
