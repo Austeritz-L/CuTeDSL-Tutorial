@@ -24,7 +24,7 @@ Layout algebra
 The notes mainly reference the local CUTLASS checkout:
 
 ```text
-/root/lizhiyuan/cutlass/python/CuTeDSL/cutlass/cute
+cutlass/python/CuTeDSL/cutlass/cute
 ```
 
 Important entry points:
