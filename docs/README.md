@@ -17,8 +17,7 @@ Layout algebra
 1. [Layout and Tensor](01_layout_tensor.md)
 2. [Copy Atom and Tiled Copy](02_copy_atom_tiledcopy.md)
 3. [MMA Atom and Tiled MMA](03_mma_atom_tiledmma.md)
-4. [ldmatrix to MMA Fragment](04_ldmatrix_to_mma_fragment.md)
-5. [Naive TensorOp GEMM Walkthrough](05_navie_tensorop_walkthrough.md)
+4. [128x128x16 LDSM TensorOp GEMM Walkthrough](04_ldsm_tensorop_kernel_walkthrough.md)
 
 ## Local Source Map
 
@@ -36,4 +35,3 @@ Important entry points:
 - `algorithm.py`: `cute.copy` and `cute.gemm`
 - `nvgpu/warp/mma.py`: Ampere warp-level MMA ops
 - `nvgpu/warp/copy.py`: `ldmatrix` copy ops
-
