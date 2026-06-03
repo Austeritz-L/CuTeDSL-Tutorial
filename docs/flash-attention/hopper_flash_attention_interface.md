@@ -16,7 +16,7 @@
 - [8. kernel 入口如何消费这些配置](#8-kernel-入口如何消费这些配置)
 - [9. Paged KV 的 TMA 路径和 cp.async fallback](#9-paged-kv-的-tma-路径和-cpasync-fallback)
 
-- [10. Case Study: Qwen2.5-7B-Instruct](#10-case-study-qwen2.5-7B-instruct)
+- [10. Case Study: Qwen2.5-7B-Instruct](#10-case-study-qwen25-7b-instruct)
 - [11. 源码阅读指南](#11-源码阅读指南)
 - [12. 结论](#12-结论)
 
