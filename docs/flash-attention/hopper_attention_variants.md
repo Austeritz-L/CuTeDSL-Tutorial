@@ -2,6 +2,17 @@
 
 > 目标：以 dense full attention 为基准，梳理 Hopper / SM90 forward 路径下 causal、local / sliding-window、varlen 等 attention 变体在计算逻辑、tile 范围、调度方式和源码实现上的差异。
 
+## 目录
+
+- [0. 阅读入口与源码定位](#0-阅读入口与源码定位)
+- [1. Dense Full Attention 作为基准](#1-dense-full-attention-作为基准)
+- [2. Causal Attention](#2-causal-attention)
+- [3. Local / Sliding-Window Attention](#3-local--sliding-window-attention)
+- [4. Varlen Attention](#4-varlen-attention)
+- [5. Packed GQA / MQA Attention](#5-packed-gqa--mqa-attention)
+- [6. Paged KV Attention](#6-paged-kv-attention)
+- [7. 后续可继续补充的章节](#7-后续可继续补充的章节)
+
 ## 0. 阅读入口与源码定位
 
 ### 0.1 主要源码文件
@@ -31,7 +42,7 @@
 - `flash_attn/cute/seqlen_info.py`
   - varlen 下读取真实 `offset_q`、`offset_k`、`seqlen_q`、`seqlen_k`。
 
-### 0.2 基准Attention模型
+### 0.2 基准Attention计算模型
 
 Dense full attention 的逻辑是：
 
@@ -1014,38 +1025,835 @@ Varlen 相比 dense full 的核心变化：
 9. varlen causal/local 会进入 LPT/head-swizzle 分支。
 ```
 
-## 5. 当前已讨论内容的对比表
+## 5. Packed GQA / MQA Attention
 
-| 场景 | 改变了什么 | Scheduler | 关键源码逻辑 |
-| --- | --- | --- | --- |
-| Dense full | 每个 Q row 看完整 K | `SingleTileScheduler` | 规则 grid，所有 M tile 看完整 N blocks |
-| Causal | 每个 Q row 只看过去 | `SingleTileLPTScheduler` | `BlockInfo.get_n_block_min_max` + LPT 反转 + L2 swizzle |
-| Local | 每个 Q row 只看窗口 | 通常 `SingleTileScheduler` | 左右 window 裁剪 `n_block_min/max`，边界 mask |
-| Varlen non-causal | batch 内 seqlen 不规则 | `SingleTileVarlenScheduler` 普通分支 | `tile_idx -> batch/head/block`，`cu_seqlens -> offset` |
-| Varlen causal/local | varlen + 可见范围约束 | `SingleTileVarlenScheduler` LPT/head-swizzle 分支 | 先解 varlen 坐标，再按真实 seqlen 做 block range |
+### 5.1 普通 MHA / GQA / MQA 的 head 映射
 
-## 6. 后续可继续补充的章节
+Dense MHA 中：
 
-### 6.1 Packed GQA / MQA
+```text
+nheads_q == nheads_kv
+Q head h -> KV head h
+```
 
-待补充问题：
+GQA / MQA 中：
 
-- 普通 GQA/MQA 如何从 Q head 映射到 KV head。
-- packed GQA 如何把 `qhead_per_kvhead` fold 到 M 维。
-- packed 后 scheduler 的 head 维为什么变成 KV head。
-- 一个 CTA 内如何处理来自多个 Q heads 的 rows。
-- packed GQA 下 Q/O/LSE load/store 如何做地址反解。
+```text
+nheads_q > nheads_kv
+qhead_per_kvhead = nheads_q / nheads_kv
+```
 
-### 6.2 Paged KV
+普通非 packed GQA 的映射是：
 
-待补充问题：
+```text
+head_idx_kv = head_idx_q // qhead_per_kvhead
+```
 
-- 普通 K/V 连续地址与 paged K/V page table 地址的区别。
-- `page_size == tile_n` 为什么可以走 TMA。
-- `page_size != tile_n` 为什么需要 `PagedKVManager + cp.async`。
-- decode / serving 中 paged KV 如何和 causal 叠加。
+例如：
 
-### 6.3 KV Cache / Decode
+```text
+nheads_q = 8
+nheads_kv = 2
+qhead_per_kvhead = 4
+
+Q head 0,1,2,3 -> KV head 0
+Q head 4,5,6,7 -> KV head 1
+```
+
+MQA 是 GQA 的极端形式：
+
+```text
+nheads_kv = 1
+qhead_per_kvhead = nheads_q
+```
+
+也就是所有 Q heads 共享同一个 KV head。
+
+### 5.2 非 packed GQA 的 CTA 视角
+
+如果不 packed，scheduler 仍然按 Q head 维度切：
+
+```text
+CTA = (m_block, q_head, batch)
+```
+
+例如：
+
+```text
+CTA0: q_head0 -> kv_head0
+CTA1: q_head1 -> kv_head0
+CTA2: q_head2 -> kv_head0
+CTA3: q_head3 -> kv_head0
+```
+
+这几个 CTA 的 Q head 不同，但 K/V head 相同。
+
+因此它们会重复围绕同一份 K/V tile 做 load / cache reuse：
+
+```text
+Q 不同
+K/V 相同
+```
+
+即使 L2 cache 能提供一些复用，K/V 复用仍然发生在多个独立 CTA 之间，而不是一个 CTA 内部。
+
+### 5.3 Packed GQA 的核心思想
+
+Packed GQA 不改变 attention 数学，只改变 layout 和调度视角。
+
+原始 SM90 内部 Q layout 类似：
+
+```text
+Q: [seqlen_q, dim, nheads_q, batch]
+```
+
+packed 后逻辑上变成：
+
+```text
+Q: [(qhead_per_kvhead, seqlen_q), dim, nheads_kv, batch]
+```
+
+也就是说：
+
+```text
+head 维从 nheads_q 变成 nheads_kv
+多出来的 qhead_per_kvhead 被 fold 到 M 维
+```
+
+### 5.4 packed M 维的含义
+
+假设：
+
+```text
+nheads_q = 8
+nheads_kv = 2
+qhead_per_kvhead = 4
+tile_m = 128
+```
+
+非 packed 时，一个 CTA 处理：
+
+```text
+128 tokens * 1 Q head
+```
+
+packed 后，一个 CTA 处理：
+
+```text
+32 tokens * 4 Q heads = 128 packed rows
+```
+
+所以从 KV head 视角看：
+
+```text
+tile_m = 128
+qhead_per_kvhead = 4
+
+真实 token 个数 = tile_m / qhead_per_kvhead = 32
+```
+
+因为每个 token 位置要放进同一个 KV head group 下的 4 个 Q heads。
+
+### 5.5 packed row 到真实 token/head 的映射
+
+packed row 的反解关系是：
+
+```text
+packed_row = m_block * tile_m + row
+
+token_idx = packed_row // qhead_per_kvhead
+q_head_in_group = packed_row % qhead_per_kvhead
+q_head = kv_head * qhead_per_kvhead + q_head_in_group
+```
+
+例如：
+
+```text
+tile_m = 128
+qhead_per_kvhead = 4
+m_block = 0
+kv_head = 0
+```
+
+则：
+
+```text
+row 0 -> token0, Q head0
+row 1 -> token0, Q head1
+row 2 -> token0, Q head2
+row 3 -> token0, Q head3
+
+row 4 -> token1, Q head0
+row 5 -> token1, Q head1
+row 6 -> token1, Q head2
+row 7 -> token1, Q head3
+
+...
+
+row 124 -> token31, Q head0
+row 125 -> token31, Q head1
+row 126 -> token31, Q head2
+row 127 -> token31, Q head3
+```
+
+### 5.6 packed 后 scheduler 的 head 维
+
+非 packed：
+
+```text
+CTA = (m_block, q_head, batch)
+head_idx 表示 Q head
+head_idx_kv = head_idx // qhead_per_kvhead
+```
+
+packed：
+
+```text
+CTA = (packed_m_block, kv_head, batch)
+head_idx 表示 KV head
+```
+
+因此一个 CTA 内部：
+
+```text
+1. sQ 的 tile_m 行来自多个 Q heads。
+2. sK/sV 来自一个 KV head。
+3. QK 对每一行独立计算。
+4. softmax state 对每一行独立维护。
+5. PV 结果按 packed row 反解写回对应 Q head 和 token。
+```
+
+关键点：
+
+```text
+packed GQA 不会把多个 Q heads 的 score 混在一起。
+M 维上的每一行仍然有独立的 row_max、row_sum 和 O accumulator。
+```
+
+### 5.7 packed GQA 与 causal/local 的关系
+
+Causal/local 判断可见 K 时，需要使用真实 token index，而不是 packed row index。
+
+因此当 `qhead_per_kvhead > 1` 时，`BlockInfo` 中会把 M index 转回 token index：
+
+```text
+m_idx_max = ceil((m_block + 1) * tile_m / qhead_per_kvhead)
+m_idx_min = floor(m_block * tile_m / qhead_per_kvhead)
+```
+
+原因：
+
+```text
+packed M 维长度 = seqlen_q * qhead_per_kvhead
+causal/local 的位置语义仍然基于真实 token index
+```
+
+### 5.8 packed GQA 的性能收益
+
+Packed GQA 的核心收益：
+
+```text
+把多个共享同一 KV head 的 Q heads 放进同一个 M tile，
+让一次 K/V 加载服务多个 Q heads。
+```
+
+非 packed：
+
+```text
+CTA0: q_head0 -> kv_head0
+CTA1: q_head1 -> kv_head0
+CTA2: q_head2 -> kv_head0
+CTA3: q_head3 -> kv_head0
+```
+
+这些 CTA 都围绕同一份 K/V。
+
+packed：
+
+```text
+CTA0: kv_head0
+      M rows = 32 tokens * 4 Q heads
+```
+
+K/V tile 只需为这个 CTA 加载一次，然后服务多个 Q heads 的 rows。
+
+收益包括：
+
+```text
+1. K/V load 复用更直接。
+2. head 维 CTA 数从 nheads_q 降到 nheads_kv。
+3. 减少重复 K/V tile 生产成本。
+4. 降低对 L2 cache 事后命中的依赖。
+5. 对 MQA 和 decode / KV cache 场景尤其有价值。
+```
+
+注意：
+
+```text
+packed GQA 不减少 QK/PV 的数学计算总量。
+每个 Q head 仍然要算自己的 attention。
+它减少的是重复 K/V 读取、producer 工作和 head 维调度碎片。
+```
+
+### 5.9 packed GQA 的代价和限制
+
+Packed GQA 的代价：
+
+```text
+1. 一个 tile_m 覆盖的真实 token 数减少为 tile_m / qhead_per_kvhead。
+2. Q/O/LSE 地址映射更复杂。
+3. TMA Q/O 需要 packgqa wrapper。
+4. tile_m 最好能被 qhead_per_kvhead 整除。
+5. 某些 splitKV、block sparse、特殊 kernel 路径可能关闭 pack。
+```
+
+源码中如果：
+
+```text
+tile_m % qhead_per_kvhead != 0
+```
+
+则 packed Q 的 TMA 路径可能不能直接使用。
+
+### 5.10 Packed GQA 小结
+
+Packed GQA 相比 dense / 普通 GQA 的核心变化：
+
+```text
+1. 普通 GQA: 多个 Q heads 共享一个 KV head。
+2. 非 packed: scheduler 仍按 Q head 切，多个 CTA 读同一 KV head。
+3. packed: scheduler 按 KV head 切，把 Q heads fold 到 M 维。
+4. 一个 tile_m 行表示 token * q_head_in_group。
+5. CTA 内共享同一份 sK/sV。
+6. softmax 仍然按 row 独立，不混合 Q heads。
+7. 性能收益主要来自 K/V 复用和调度维度重排。
+```
+
+## 6. Paged KV Attention
+
+### 6.1 Dense KV 的地址模型
+
+普通 dense / varlen K/V 中，一个 batch 内部的 K/V 是逻辑连续的。
+
+Dense 形态：
+
+```text
+K: [batch, seqlen_k, nheads_kv, head_dim]
+V: [batch, seqlen_k, nheads_kv, head_dim_v]
+```
+
+给定：
+
+```text
+batch_idx
+head_idx_kv
+n_block
+tile_n = 128
+```
+
+如果：
+
+```text
+n_block = 3
+```
+
+则读取：
+
+```text
+K[batch_idx, 384:512, head_idx_kv, :]
+V[batch_idx, 384:512, head_idx_kv, :]
+```
+
+这是规则连续的 2D tile，适合 TMA。
+
+### 6.2 Paged KV 的 tensor 形态
+
+Paged KV 中，K/V 不再按 batch 直接连续存储，而是放在全局 page pool 中：
+
+```text
+K: [num_pages, page_size, nheads_kv, head_dim]
+V: [num_pages, page_size, nheads_kv, head_dim_v]
+
+page_table: [batch, max_num_pages_per_seq]
+```
+
+含义：
+
+```text
+num_pages:
+    全局 K/V cache 池中的物理 page 数。
+
+page_size:
+    每个 page 能存多少个 token 的 K/V。
+
+nheads_kv:
+    KV head 数。
+
+head_dim / head_dim_v:
+    K/V 向量维度。
+```
+
+访问：
+
+```text
+K[p, t, h, d]
+```
+
+表示：
+
+```text
+物理 page p 中，第 t 个 token slot，第 h 个 KV head，第 d 维 K 值。
+```
+
+### 6.3 page_table 的含义
+
+`page_table` 是逻辑序列到物理 page 的映射表：
+
+```text
+page_table[b, logical_page_idx] = physical_page_idx
+```
+
+也就是：
+
+```text
+batch 中第 b 条 sequence/request 的第 logical_page_idx 个逻辑 page，
+实际放在全局 K/V page pool 的 physical_page_idx 号物理 page。
+```
+
+注意：
+
+```text
+一个 batch 不是一个 request。
+一个 batch 包含多个 request / sequence。
+batch 维上的每个元素通常对应一个 request。
+```
+
+如果：
+
+```text
+batch = 4
+```
+
+则：
+
+```text
+request0 -> page_table[0, :]
+request1 -> page_table[1, :]
+request2 -> page_table[2, :]
+request3 -> page_table[3, :]
+```
+
+### 6.4 page_table 示例
+
+假设：
+
+```text
+page_size = 4
+batch = 3
+max_num_pages_per_seq = 5
+
+page_table =
+batch0: [10, 11, 12, -1, -1]
+batch1: [ 7, 30,  2, 19, -1]
+batch2: [ 5, -1, -1, -1, -1]
+```
+
+表示：
+
+```text
+batch0 / request0:
+    logical token 0..3   -> physical page 10
+    logical token 4..7   -> physical page 11
+    logical token 8..11  -> physical page 12
+
+batch1 / request1:
+    logical token 0..3   -> physical page 7
+    logical token 4..7   -> physical page 30
+    logical token 8..11  -> physical page 2
+    logical token 12..15 -> physical page 19
+
+batch2 / request2:
+    logical token 0..3   -> physical page 5
+```
+
+K/V 的物理 page pool 是全局共享的，但每条 request 通过自己的 `page_table[b, :]` 看到一条逻辑连续序列。
+
+### 6.5 逻辑 token 到物理 K/V 的地址翻译
+
+给定：
+
+```text
+batch_idx
+logical token j
+head_idx_kv
+```
+
+地址翻译为：
+
+```text
+logical_page_idx = j // page_size
+offset_in_page = j % page_size
+physical_page = page_table[batch_idx, logical_page_idx]
+
+K_logical[batch_idx, j, head_idx_kv, :] =
+    K[physical_page, offset_in_page, head_idx_kv, :]
+
+V_logical[batch_idx, j, head_idx_kv, :] =
+    V[physical_page, offset_in_page, head_idx_kv, :]
+```
+
+所以 Paged KV 中没有直接的：
+
+```text
+K[batch, seqlen, head, dim]
+```
+
+而是：
+
+```text
+logical K/V sequence
+    -> page_table
+    -> physical K/V page pool
+```
+
+### 6.6 为什么需要 Paged KV
+
+Paged KV 主要用于 KV cache / serving 场景。
+
+生成式推理中：
+
+```text
+1. 每个 request 长度不同。
+2. 每个 request 会持续增长。
+3. 如果按最大长度给每个 request 分配连续 cache，显存浪费很大。
+4. 动态增删 request 会产生碎片。
+```
+
+Paged KV 类似虚拟内存分页：
+
+```text
+request A 的逻辑 page0 -> physical page 10
+request A 的逻辑 page1 -> physical page 37
+request A 的逻辑 page2 -> physical page 12
+
+request B 的逻辑 page0 -> physical page 4
+request B 的逻辑 page1 -> physical page 9
+```
+
+优点：
+
+```text
+1. K/V cache 可以按 page 动态分配。
+2. 长短序列混合时显存碎片更少。
+3. decode 时可以持续追加新 pages。
+4. batch 内 request 可以有不同 cache 长度。
+```
+
+### 6.7 page_size == tile_n: TMA paged path
+
+如果：
+
+```text
+page_size == tile_n
+```
+
+那么一个 N tile 正好对应一个 logical page。
+
+例如：
+
+```text
+page_size = 128
+tile_n = 128
+page_table[0] = [5, 9, 3, 20]
+```
+
+则：
+
+```text
+n_block 0 -> logical tokens 0..127   -> physical page 5
+n_block 1 -> logical tokens 128..255 -> physical page 9
+n_block 2 -> logical tokens 256..383 -> physical page 3
+n_block 3 -> logical tokens 384..511 -> physical page 20
+```
+
+此时 producer 只需要：
+
+```text
+page_idx = page_table[batch_idx, n_block]
+```
+
+然后 TMA 加载：
+
+```text
+K[page_idx, 0:tile_n, head_idx_kv, :]
+V[page_idx, 0:tile_n, head_idx_kv, :]
+```
+
+这与 dense TMA 很像：
+
+```text
+dense:
+    src_idx = n_block
+
+paged TMA:
+    src_idx = page_table[batch_idx, n_block]
+```
+
+所以当前 SM90 实现中：
+
+```text
+page_size == tile_n
+    -> paged_kv_non_tma = False
+    -> use_tma_KV = True
+```
+
+### 6.8 page_size != tile_n: cp.async fallback
+
+源码中 SM90 forward 构造参数：
+
+```text
+paged_kv_non_tma = page_size not in [None, tile_n]
+```
+
+也就是：
+
+```text
+page_size is None:
+    非 paged K/V，TMA
+
+page_size == tile_n:
+    paged K/V，TMA
+
+page_size != tile_n:
+    paged K/V，non-TMA
+    PagedKVManager + cp.async
+```
+
+### 6.9 情况 A: page_size < tile_n
+
+例如：
+
+```text
+page_size = 64
+tile_n = 128
+```
+
+一个 N tile 会跨多个 pages：
+
+```text
+n_block 0 wants logical tokens 0..127
+
+= page_table[b, 0] offset 0..63
++ page_table[b, 1] offset 0..63
+```
+
+shared memory 中要拼成：
+
+```text
+sK[0:64, :]    <- K[page0, 0:64, :]
+sK[64:128, :]  <- K[page1, 0:64, :]
+```
+
+理论上可以设计成多次 partial TMA，但当前 SM90 CuTe 路径没有实现这种：
+
+```text
+一个 n_block 内多次 page_table lookup
+多次 TMA
+每次写 shared memory 的不同 row offset
+```
+
+因此走 `PagedKVManager + cp.async` 手工拼 tile。
+
+### 6.10 情况 B: page_size > tile_n
+
+例如：
+
+```text
+page_size = 256
+tile_n = 128
+```
+
+一个 page 包含多个 N tiles：
+
+```text
+n_block 0 -> page0 offset 0..127
+n_block 1 -> page0 offset 128..255
+```
+
+每个块内部确实仍然连续。
+
+但当前 paged TMA path 假设：
+
+```text
+n_block == logical_page_idx
+offset_in_page == 0
+```
+
+也就是：
+
+```text
+page_idx = page_table[batch_idx, n_block]
+```
+
+当 `page_size > tile_n` 时，正确关系应该是：
+
+```text
+logical_page_idx = (n_block * tile_n) // page_size
+offset_in_page = (n_block * tile_n) % page_size
+physical_page = page_table[batch_idx, logical_page_idx]
+```
+
+这需要 TMA source coordinate 表达 page 内 offset。
+
+当前实现没有为 paged path 构造：
+
+```text
+physical_page + offset_in_page
+```
+
+这种 TMA 坐标逻辑，所以同样归入 non-TMA paged path。
+
+### 6.11 page_size != tile_n 并非理论上不能 TMA
+
+需要特别注意：
+
+```text
+page_size != tile_n 并不是硬件理论上绝对不能 TMA。
+```
+
+更准确地说：
+
+```text
+当前 SM90 CuTe forward 的 TMA abstraction 和 producer pipeline
+围绕 one logical N block <-> one physical page <-> one full TMA tile 设计。
+```
+
+当 page 和 tile 不一一对应时：
+
+```text
+page_size < tile_n:
+    一个 N tile 跨多个 pages，需要 partial / gather TMA。
+
+page_size > tile_n:
+    一个 page 包含多个 N tiles，需要 page 内 offset TMA。
+```
+
+当前实现选择统一使用更通用的：
+
+```text
+PagedKVManager + cp.async
+```
+
+来覆盖这些情况。
+
+### 6.12 cp.async fallback 的语义
+
+non-TMA paged KV 可以理解为手工 gather：
+
+```text
+目标:
+    sK[0:tile_n, :]
+    sV[0:tile_n, :]
+
+对 tile 内 logical row:
+    logical_token = n_block * tile_n + row
+    logical_page = logical_token // page_size
+    offset = logical_token % page_size
+    physical_page = page_table[batch_idx, logical_page]
+
+    copy K[physical_page, offset, head_idx_kv, :] -> sK[row, :]
+    copy V[physical_page, offset, head_idx_kv, :] -> sV[row, :]
+```
+
+真实实现会多线程分工、向量化并使用 `cp.async`，但语义就是把逻辑连续 K/V tile 拼到 shared memory。
+
+### 6.13 Paged KV 与 causal/local 的叠加
+
+Paged KV 只影响：
+
+```text
+K/V 从哪里读。
+```
+
+Causal/local 决定：
+
+```text
+哪些 K/V n_blocks 可见。
+```
+
+因此执行顺序是：
+
+```text
+1. scheduler 给出 m_block, head_idx, batch_idx
+2. BlockInfo 根据 causal/local/seqlen 计算 n_block_min/n_block_max
+3. mainloop 遍历这些 n_blocks
+4. 对每个 n_block：
+       dense KV:
+           直接按 n_block 读连续 K/V tile
+       paged KV:
+           通过 page_table 找 physical page / offset
+5. 执行 QK -> mask -> softmax -> PV
+```
+
+### 6.14 Paged KV 与 varlen 的区别
+
+Varlen 解决的是：
+
+```text
+不同 batch 的序列长度不同。
+每个 batch 在 total_k 中有不同 offset。
+但一个 batch 内部 K/V 仍然连续。
+```
+
+访问形式：
+
+```text
+K[offset_k + j]
+```
+
+Paged KV 解决的是：
+
+```text
+一个 batch / request 内部的逻辑 K/V 也被拆成 pages。
+逻辑连续，物理不连续。
+```
+
+访问形式：
+
+```text
+logical_page = j // page_size
+offset = j % page_size
+physical_page = page_table[batch, logical_page]
+K[physical_page, offset]
+```
+
+总结：
+
+```text
+varlen:
+    batch -> offset -> 连续区域
+
+paged:
+    batch + logical page -> physical page
+```
+
+### 6.15 Paged KV 小结
+
+Paged KV 相比 dense KV 的核心变化：
+
+```text
+1. K/V 不再按 batch 连续存储，而是存入全局 page pool。
+2. page_table 的每一行对应 batch 中一条 request 的逻辑页表。
+3. logical token 需要先转换成 logical page 和 offset。
+4. logical page 再通过 page_table 映射到 physical page。
+5. page_size == tile_n 时，一个 N tile 正好一个 page，可以走当前 TMA path。
+6. page_size != tile_n 时，当前 SM90 实现走 PagedKVManager + cp.async。
+7. Paged KV 主要改变 K/V 地址计算，不改变 attention 数学。
+```
+
+## 7. 后续可继续补充的章节
+
+### 7.1 KV Cache / Decode
 
 待补充问题：
 
@@ -1054,7 +1862,7 @@ Varlen 相比 dense full 的核心变化：
 - causal decode 如何通过 `seqlen_k - seqlen_q` 对齐位置。
 - SM90 不支持 SplitKV 对长 K 的影响。
 
-### 6.4 Softcap / score_mod / mask_mod / learnable sink
+### 7.2 Softcap / score_mod / mask_mod / learnable sink
 
 待补充问题：
 
@@ -1062,4 +1870,3 @@ Varlen 相比 dense full 的核心变化：
 - 哪些变体改变可见性。
 - 哪些变体只改变 softmax finalize。
 - custom mask 为什么会关闭内置 causal/local 混合逻辑。
-
