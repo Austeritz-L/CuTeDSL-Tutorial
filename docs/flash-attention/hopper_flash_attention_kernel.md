@@ -1,312 +1,661 @@
-# Hopper FlashAttention Kernel 实现细节
+# Hopper FlashAttention Kernel 实现链路
 
-本文聚焦 `FlashAttentionForwardSm90` 的 kernel 具体实现，尽量从硬件执行视角解释 Hopper forward FlashAttention：分块大小、shared memory layout、TMA pipeline、WGMMA 指令组织、online softmax、producer-consumer 调度、epilogue 写回。
+本文承接上一份“上层接口链路”文档，继续深入 Hopper / SM90 FlashAttention forward kernel 的 device-side 实现。
 
-源码位置：
-
-- SM90 kernel：`flash-attention/flash_attn/cute/flash_fwd_sm90.py`
-- forward 基类和 epilogue：`flash-attention/flash_attn/cute/flash_fwd.py`
-- named barrier：`flash-attention/flash_attn/cute/named_barrier.py`
-- pipeline 工具：`flash-attention/flash_attn/cute/pipeline.py`
-
-## 1. Kernel 的数学目标
-
-Forward FlashAttention 对每个 batch/head/Q block 做：
+上一份文档解释的是：
 
 ```text
-S = Q @ K^T * softmax_scale
-S = apply_mask(S)
-P = softmax(S)
-O = P @ V
-LSE = logsumexp(S)
+Python API
+  -> _flash_attn_fwd
+  -> FlashAttentionForwardSm90.__call__
+  -> kernel.launch 之前的配置
 ```
 
-Hopper kernel 不会 materialize 全局 `S` 或 `P`。它按 K/V 的 N block 流式扫描，使用 online softmax 累积：
+本文解释的是：
 
 ```text
-for n_block in K/V blocks:
-    S_tile = Q_tile @ K_tile^T
-    P_tile, row_scale = online_softmax_update(S_tile)
-    O = O * row_scale + P_tile @ V_tile
+FlashAttentionForwardSm90.kernel
+  -> producer load Q/K/V
+  -> consumer QK / mask / online softmax / PV
+  -> epilogue store O/LSE
 ```
 
-这样全局内存只读 Q/K/V，写 O/LSE，中间 `S/P` 只在寄存器或 shared memory 中短暂存在。
-
-## 2. 典型 Hopper tile 配置
-
-SM90 tile 由接口层 `_tile_size_fwd_sm90` 选择。
-
-常见配置：
-
-| head_dim | tile_m | tile_n | tile_hdim | MMA WGs | threads | K/V stages |
-| --- | --- | --- | --- | --- | --- | --- |
-| 64 | 192 | 128 | 64 | 3 | 512 | 2 |
-| 96 causal/local | 192 | 128 | 96 | 3 | 512 | 2 |
-| 96 non-causal | 192 | 144 | 96 | 3 | 512 | 2 |
-| 128 | 128 | 128 | 128 | 2 | 384 | 2 |
-| 192 | 128 | 96/112/128 | 192 | 2 | 384 | 2 |
-| 256 | 128 | 64/80 | 256 | 2 | 384 | 2 |
-
-其中：
-
-- `tile_m`: Q rows per CTA。
-- `tile_n`: K/V rows per pipeline iteration。
-- `tile_hdim`: `head_dim` pad 到 16 倍数。
-- `tile_hdimv`: `head_dim_v` pad 到 16 倍数。
-- `num_stages=2`: K/V shared memory pipeline 双缓冲。
-- `MMA WGs = tile_m // 64`。
-
-为什么 `tile_m` 以 64 为单位：
-
-- SM90 WGMMA 的常见输出 tile 以 64 行为一个 warpgroup 粒度。
-- `atom_layout_mnk=(tile_m // 64, 1, 1)` 表示沿 M 方向复制多个 WGMMA atom。
-- `tile_m=128` 时有 2 个 consumer warpgroup；`tile_m=192` 时有 3 个。
-
-## 3. CTA 线程组织
-
-kernel block 里线程分成两类：
+源码路径基于本地仓库：
 
 ```text
-warp_idx 0..3     producer warpgroup, 128 threads
-warp_idx 4..7     consumer WG0, 128 threads
-warp_idx 8..11    consumer WG1, 128 threads
-warp_idx 12..15   consumer WG2, 128 threads, 仅 tile_m=192 时存在
+flash-attention-src/
+  flash_attn/cute/flash_fwd_sm90.py
+  flash_attn/cute/flash_fwd.py
+  flash_attn/cute/softmax.py
+  flash_attn/cute/block_info.py
+  flash_attn/cute/seqlen_info.py
+  flash_attn/cute/mask.py
+  flash_attn/cute/paged_kv.py
+  flash_attn/cute/tile_scheduler.py
 ```
 
-总线程数：
+本文仍然沿用一个真实推理场景风格的 case：
 
 ```text
-num_threads = 128 * (num_mma_warpgroups + 1)
+模型: Qwen2.5-7B 风格
+GPU: H100 / SM90
+dtype: bf16
+阶段: chunked prefill with paged KV cache
+
+cached prefix = 2048 tokens
+current chunk = 1024 tokens
+visible KV = 3072 tokens
+page_size = 128
+
+q: [1, 1024, 28, 128]
+k_cache_paged: [num_physical_pages, 128, 4, 128]
+v_cache_paged: [num_physical_pages, 128, 4, 128]
+page_table: [1, max_pages_per_seq]
+seqused_k: [1] = [3072]
+causal = True
+
+head_dim = 128
+head_dim_v = 128
+qhead_per_kvhead = 7
+tile_m = 128
+tile_n = 128
+num_stages = 2
+mma_pv_is_rs = True
+intra_wg_overlap = True
 ```
 
-源码分支：
+## 目录
+
+1. [Kernel 总体结构](#1-kernel-总体结构)
+2. [Kernel 开头: descriptor、shared storage、pipeline](#2-kernel-开头-descriptorshared-storagepipeline)
+3. [BlockInfo、SeqlenInfo、AttentionMask、Scheduler](#3-blockinfoseqleninfoattentionmaskscheduler)
+4. [Producer: `load`](#4-producer-load)
+5. [Consumer: `mma`](#5-consumer-mma)
+6. [Mainloop: 从右往左扫 K/V blocks](#6-mainloop-从右往左扫-kv-blocks)
+7. [QK、mask、online softmax、PV](#7-qkmaskonline-softmaxpv)
+8. [Online Softmax 实现](#8-online-softmax-实现)
+9. [Mask 实现和 chunked prefill causal offset](#9-mask-实现和-chunked-prefill-causal-offset)
+10. [Epilogue: 写 O 和 LSE](#10-epilogue-写-o-和-lse)
+11. [Qwen Case 代入: 一个 work tile 发生了什么](#11-qwen-case-代入-一个-work-tile-发生了什么)
+12. [Kernel 的关键设计收益](#12-kernel-的关键设计收益)
+13. [源码阅读顺序](#13-源码阅读顺序)
+14. [总结](#14-总结)
+
+## 1. Kernel 总体结构
+
+SM90 forward kernel 的入口在：
 
 ```python
-if warp_idx < 4:
-    setmaxregister_decrease(num_producer_regs)
+# flash_fwd_sm90.py
+@cute.kernel
+def kernel(
+    self,
+    mQ,
+    mK,
+    mV,
+    mO,
+    mLSE,
+    mCuSeqlensQ,
+    mCuSeqlensK,
+    mSeqUsedQ,
+    mSeqUsedK,
+    mPageTable,
+    tma_atom_Q,
+    tma_atom_K,
+    tma_atom_V,
+    tma_atom_O,
+    softmax_scale_log2,
+    softmax_scale,
+    window_size_left,
+    window_size_right,
+    learnable_sink,
+    blocksparse_tensors,
+    sQ_layout,
+    sK_layout,
+    sV_layout,
+    sO_layout,
+    sP_layout,
+    gmem_tiled_copy_Q,
+    gmem_tiled_copy_K,
+    gmem_tiled_copy_V,
+    gmem_tiled_copy_O,
+    tiled_mma_qk,
+    tiled_mma_pv,
+    tile_sched_params,
+    TileScheduler,
+    SharedStorage,
+    aux_tensors,
+    fastdiv_mods=None,
+):
+```
+
+这些参数几乎全部来自 `FlashAttentionForwardSm90.__call__`。kernel 本身不再重新决定 tile、MMA、TMA descriptor、shared layout、scheduler 类型，而是直接消费这些已经配置好的对象。
+
+kernel 内部可以粗略分成五段：
+
+```text
+1. TMA descriptor prefetch
+2. shared memory / mbarrier / pipeline 初始化
+3. 获取 shared memory tensor view
+4. 构造 BlockInfo / SeqlenInfo / AttentionMask / TileScheduler 闭包
+5. 按 warpgroup 分成 producer 和 consumer:
+      producer: load Q/K/V
+      consumer: QK, mask, online softmax, PV, epilogue
+```
+
+源码上最关键的分流是：
+
+```python
+if warp_idx < 4:  # Producer
+    cute.arch.setmaxregister_decrease(self.num_producer_regs)
     self.load(...)
-else:
-    setmaxregister_increase(num_mma_regs)
-    tidx = tidx - 128
+else:             # Consumer
+    cute.arch.setmaxregister_increase(self.num_mma_regs)
     self.mma(...)
 ```
 
-寄存器预算：
-
-| MMA WG 数 | producer regs | consumer regs |
-| --- | --- | --- |
-| 1 | 56 | 256 |
-| 2 | 24 或 40 | 240 或 224 |
-| 3 | 32 | 160 |
-
-这不是简单优化项，而是 Hopper warpgroup specialization 的重要组成部分：producer 负责搬运，consumer 持有大量 accumulator 和 softmax fragment。
-
-## 4. Shared memory 分配
-
-`FlashAttentionForwardSm90._get_shared_storage_cls()` 定义 shared storage。
-
-主要对象：
+SM90 的一个 warpgroup 是 128 threads，也就是 4 warps。对本 case：
 
 ```text
-sQ: tile_m x tile_hdim
-sK: tile_n x tile_hdim x num_stages
-sV: tile_n x tile_hdimv x num_stages
-sP: tile_m x tile_n, 仅 mma_pv_is_rs=False 时存在
-sO: tile_m x tile_hdimv, 复用 sQ 的 storage 做 epilogue staging
-mbar_ptr_Q: 1 * 2
-mbar_ptr_K: num_stages * 2
-mbar_ptr_V: num_stages * 2
+block = 384 threads
+
+warp_idx 0..3:
+    producer warpgroup
+
+warp_idx 4..7:
+    consumer warpgroup 0
+
+warp_idx 8..11:
+    consumer warpgroup 1
 ```
 
-shared memory usage 在基类 `can_implement` 中估算：
+也就是说：
 
 ```text
-Q bytes = tile_m * head_dim * 2
-K bytes = tile_n * head_dim * num_stages * 2
-V bytes = tile_n * head_dim_v * num_stages * 2
-total ~= Q + K + V
+1 个 producer WG + 2 个 consumer WG
 ```
 
-如果 `Q_in_regs=True`，Q 和 V 的 storage 有复用逻辑；当前 Hopper forward 构造时通常是 `Q_in_regs=False`。
+这是 Hopper FlashAttention kernel 的基本执行模型。
 
-`sP` 是否存在取决于 `mma_pv_is_rs`：
+## 2. Kernel 开头: descriptor、shared storage、pipeline
 
-- `mma_pv_is_rs=True`: softmax 后的 P 留在寄存器，作为 PV WGMMA 的 A operand。
-- `mma_pv_is_rs=False`: P 先写到 shared memory，再从 shared memory 作为 PV 的 A operand。
+### 2.1 TMA descriptor prefetch
 
-## 5. Shared memory layout 和 swizzle
-
-SM90 使用 CuTe 的 swizzled shared memory layout：
+源码：
 
 ```python
-sQ_layout_atom = warpgroup.make_smem_layout_atom(
-    sm90_utils_basic.get_smem_layout_atom(ROW_MAJOR, dtype, tile_hdim),
-    dtype,
+warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+if warp_idx == 0:
+    for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
+        if const_expr(tma_atom is not None):
+            cpasync.prefetch_descriptor(tma_atom)
+```
+
+`tma_atom_Q/K/V/O` 是 `__call__` 阶段创建好的 TMA copy atom。descriptor prefetch 的目的，是让 TMA descriptor 更早进入合适的 cache / descriptor path，减少后面第一次 TMA bulk copy 的延迟。
+
+本 case 中：
+
+```text
+use_tma_Q = True
+use_tma_KV = True
+use_tma_O = True
+```
+
+所以 Q/K/V/O 都有 TMA atom，会被 warp 0 prefetch。
+
+### 2.2 SharedStorage 分配
+
+源码：
+
+```python
+smem = cutlass.utils.SmemAllocator()
+storage = smem.allocate(SharedStorage)
+```
+
+`SharedStorage` 是 `__call__` 里通过 `_get_shared_storage_cls()` 生成的类型。本 case 的 shared storage 包含：
+
+```text
+mbar_ptr_Q: Q pipeline mbarriers
+mbar_ptr_K: K pipeline mbarriers
+mbar_ptr_V: V pipeline mbarriers
+sV
+sQ
+sK
+sP
+```
+
+本 case `mma_pv_is_rs=True`，所以 `sP` 的 cosize 为 0，实际不需要 P shared memory。
+
+### 2.3 Pipeline 初始化
+
+源码：
+
+```python
+ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
+tma_warp = ThreadCooperativeGroup(1)
+load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
+mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
+```
+
+含义：
+
+```text
+tma_warp:
+    TMA path 下由 1 个 warp 发起 bulk copy。
+
+load_threads:
+    cp.async fallback 时，整个 producer warpgroup 的 128 threads 可以参与普通 async copy。
+
+mma_warps:
+    consumer 侧参与 WGMMA/softmax/PV 的 warps。
+```
+
+Q pipeline：
+
+```python
+if self.use_tma_Q:
+    pipeline_q = PipelineTmaAsync.create(
+        barrier_storage=mbar_ptr_Q,
+        num_stages=1,
+        producer_group=tma_warp,
+        consumer_group=mma_warps,
+        tx_count=self.tma_copy_bytes["Q"],
+        defer_sync=True,
+    )
+else:
+    pipeline_q = PipelineCpAsync.create(...)
+```
+
+K/V pipeline：
+
+```python
+if self.use_tma_KV:
+    pipeline_k = PipelineTmaAsync.create(
+        barrier_storage=storage.mbar_ptr_K.data_ptr(),
+        num_stages=self.num_stages,
+        producer_group=tma_warp,
+        consumer_group=mma_warps,
+        tx_count=self.tma_copy_bytes["K"],
+        defer_sync=True,
+    )
+    pipeline_v = PipelineTmaAsync.create(
+        barrier_storage=storage.mbar_ptr_V.data_ptr(),
+        num_stages=self.num_stages,
+        producer_group=tma_warp,
+        consumer_group=mma_warps,
+        tx_count=self.tma_copy_bytes["V"],
+        defer_sync=True,
+    )
+else:
+    pipeline_k = PipelineCpAsync.create(...)
+    pipeline_v = PipelineCpAsync.create(...)
+```
+
+本 case：
+
+```text
+Q pipeline:
+    TMA, 1 stage
+
+K pipeline:
+    TMA, 2 stages
+
+V pipeline:
+    TMA, 2 stages
+```
+
+`tx_count` 来自 `__call__` 中的：
+
+```text
+Q: 128 * 128 * 2 bytes = 32 KB
+K: 128 * 128 * 2 bytes = 32 KB
+V: 128 * 128 * 2 bytes = 32 KB
+```
+
+TMA mbarrier 需要知道每次 transaction 期望到达多少 bytes，consumer 才能正确 wait。
+
+### 2.4 Shared memory tensor view
+
+源码：
+
+```python
+sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+
+if const_expr(not self.Q_in_regs):
+    sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+else:
+    sV = storage.sQ.get_tensor(...)
+
+sVt = layout_utils.transpose_view(sV)
+
+sP = None
+if const_expr(sP_layout is not None):
+    sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+
+sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+```
+
+本 case：
+
+```text
+sQ: [128, 128]
+sK: [128, 128, 2]
+sV: [128, 128, 2]
+sVt: transpose view of sV
+sP: None
+sO: reuse sQ storage for output epilogue
+```
+
+为什么 `sVt` 要 transpose view：
+
+```text
+PV WGMMA 需要把 V 当成 [head_dim_v, tile_n] 的 B operand view。
+原始 sV 是 [tile_n, head_dim_v, stage]。
+transpose_view 不拷贝数据，只给 WGMMA 一个适合的 layout view。
+```
+
+为什么 `sO` 可以复用 `sQ`：
+
+```text
+计算结束后 Q tile 已经不会再被 WGMMA 使用。
+epilogue 需要一个 shared memory staging buffer 把 acc_O 写回 gmem。
+所以 sO 复用 sQ storage，减少 shared memory footprint。
+```
+
+## 3. BlockInfo、SeqlenInfo、AttentionMask、Scheduler
+
+kernel 中会构造几个“类闭包”，producer 和 consumer 都用同一套逻辑。
+
+### 3.1 BlockInfo
+
+源码：
+
+```python
+block_info = BlockInfo(
+    self.tile_m,
+    self.tile_n,
+    self.is_causal,
+    self.is_local,
+    False,  # is_split_kv
+    window_size_left,
+    window_size_right,
+    qhead_per_kvhead_packgqa=self.qhead_per_kvhead if self.pack_gqa else 1,
 )
 ```
 
-Q/K/V/O 都通过类似函数生成 layout atom，再 tile 到完整 shape：
+`BlockInfo` 主要负责：
 
 ```text
-sQ_layout: tile_m x tile_hdim
-sK_layout: tile_n x tile_hdim x num_stages
-sV_layout: tile_n x tile_hdimv x num_stages
-sO_layout: tile_m x tile_hdimv
+给定一个 Q block，计算需要遍历哪些 K/V n_blocks。
 ```
 
-这些 layout 的目的：
-
-- 满足 WGMMA 对 shared memory operand 的对齐和 swizzle 要求。
-- 降低 bank conflict。
-- 让 TMA 写入的 shared memory tile 可以直接被 WGMMA 消费。
-
-## 6. TMA 和 cp.async
-
-Hopper 主路径优先使用 TMA：
-
-```text
-Q/K/V: CopyBulkTensorTileG2SOp
-O:     CopyBulkTensorTileS2GOp
-```
-
-TMA 的特点：
-
-- 由少数线程发起，通常 producer 的 warp 0。
-- 使用 memory barrier 跟 consumer 同步。
-- 适合规则的 2D tile，从 global bulk copy 到 shared。
-
-非 TMA 路径：
-
-- paged KV 且 `page_size != tile_n` 时，K/V 走 `PagedKVManager + cp.async`。
-- Q 在某些 pack GQA 对不齐场景也可能走 cp.async。
-
-cp.async copy atom 在基类中定义：
+核心函数：
 
 ```python
-cpasync.CopyG2SOp(cache_mode=GLOBAL)
-num_bits_per_copy = 128
+def get_n_block_min_max(self, seqlen_info, m_block, split_idx=0, num_splits=1):
+    n_block_max = ceil_div(seqlen_info.seqlen_k, self.tile_n)
+    if self.is_causal or (self.is_local and self.window_size_right is not None):
+        m_idx_max = (m_block + 1) * self.tile_m
+        if self.qhead_per_kvhead_packgqa > 1:
+            m_idx_max = ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+        n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        n_idx_right = n_idx if self.is_causal else n_idx + self.window_size_right
+        n_block_max = min(n_block_max, ceil_div(n_idx_right, self.tile_n))
+    ...
+    return n_block_min, n_block_max
 ```
 
-也就是说 cp.async 路径按 128-bit vectorized copy 组织。
-
-## 7. Pipeline 结构
-
-SM90 forward 有三条 pipeline：
+对 chunked prefill，`seqlen_k - seqlen_q` 就是 prefix offset：
 
 ```text
-pipeline_q: 1 stage
-pipeline_k: num_stages, 通常 2
-pipeline_v: num_stages, 通常 2
+seqlen_q = 1024
+seqlen_k = 3072
+seqlen_k - seqlen_q = 2048
 ```
 
-Q 只需要一个 stage，因为一个 CTA 的 Q tile 在整个 K/V streaming 过程中重复使用。
+这表示当前 chunk 的第 0 个 query token 对应全局 position 2048。
 
-K/V 需要 double buffer，因为 mainloop 一边消费当前 `n_block`，一边预取下一个 `n_block`。
+### 3.2 SeqlenInfoCls
 
-TMA pipeline 的参与者：
-
-```text
-producer group: 1 thread, 用于 TMA 发起
-consumer group: MMA warps
-```
-
-cp.async pipeline 的参与者：
-
-```text
-producer group: 128 load threads
-consumer group: MMA warps
-```
-
-kernel 开始时会执行：
-
-```text
-pipeline_init_arrive
-pipeline_init_wait
-```
-
-用 cluster/barrier 语义保证 pipeline barrier 初始化完成后再进入 producer/consumer 正式逻辑。
-
-## 8. Named barrier
-
-SM90 forward 使用 `NamedBarrierFwd`：
+源码：
 
 ```python
-Epilogue = 1
-WarpSchedulerWG1 = 2
-WarpSchedulerWG2 = 3
-WarpSchedulerWG3 = 4
-PFull = 5
-PEmpty = 6
+SeqlenInfoCls = partial(
+    SeqlenInfoQK.create,
+    seqlen_q_static=mQ.shape[0] if not self.pack_gqa else mQ.shape[0][1],
+    seqlen_k_static=mK.shape[0] if mPageTable is None else mK.shape[0] * mPageTable.shape[1],
+    mCuSeqlensQ=mCuSeqlensQ,
+    mCuSeqlensK=mCuSeqlensK,
+    mSeqUsedQ=mSeqUsedQ,
+    mSeqUsedK=mSeqUsedK,
+    ...
+)
 ```
 
-主要用途：
+paged KV 情况下：
 
-- `Epilogue`: O 从寄存器写 shared、shared 再 TMA/copy 写 global 时同步。
-- `WarpSchedulerWG*`: intra-warpgroup overlap 中协调不同 consumer warpgroup 的 QK/PV 节奏。
-- `PFull/PEmpty`: P 走 shared memory 时用于生产/消费同步。
+```text
+mK.shape[0] = page_size
+mPageTable.shape[1] = max pages per seq
+seqlen_k_static = page_size * max_pages_per_seq
+```
 
-## 9. Load producer 逻辑
-
-producer 入口是 `FlashAttentionForwardSm90.load`。
-
-核心变量：
+但真实长度由 `mSeqUsedK` 决定：
 
 ```python
-kv_producer_state = make_pipeline_state(Producer, num_stages)
-q_producer_phase = 1
+if mSeqUsedK is not None:
+    seqlen_k = mSeqUsedK[batch_idx]
+else:
+    seqlen_k = seqlen_k_static
+```
+
+本 case：
+
+```text
+mSeqUsedK[0] = 3072
+```
+
+所以 kernel 内 `seqlen.seqlen_k = 3072`。
+
+### 3.3 AttentionMaskCls
+
+源码：
+
+```python
+AttentionMaskCls = partial(
+    AttentionMask,
+    self.tile_m,
+    self.tile_n,
+    window_size_left=window_size_left,
+    window_size_right=window_size_right,
+    qhead_per_kvhead_packgqa=self.qhead_per_kvhead if self.pack_gqa else 1,
+)
+```
+
+consumer 每个 work tile 里会：
+
+```python
+mask = AttentionMaskCls(seqlen)
+mask_fn = partial(
+    mask.apply_mask,
+    batch_idx=batch_idx,
+    head_idx=head_idx,
+    m_block=m_block,
+    thr_mma=thr_mma_qk,
+    mask_causal=self.is_causal,
+    mask_local=self.is_local,
+    aux_tensors=aux_tensors,
+    fastdiv_mods=fastdiv_mods,
+)
+```
+
+`mask.apply_mask` 会基于：
+
+```text
+m_block
+n_block
+seqlen_q
+seqlen_k
+causal/local/window
+pack_gqa head mapping
+```
+
+把 `acc_S` 中不可见的位置设成 `-inf`。
+
+### 3.4 TileSchedulerCls
+
+源码：
+
+```python
+TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
+```
+
+producer 和 consumer 都创建自己的 scheduler：
+
+```python
 tile_scheduler = TileSchedulerCls()
 work_tile = tile_scheduler.initial_work_tile_info()
 ```
 
-每个 work tile 对应：
+它们拿到同样的 `(m_block, head_idx, batch_idx, split_idx)` 序列，保证 producer 加载的 tile 和 consumer 计算的 tile 对齐。
+
+本 case 因为 dense causal：
 
 ```text
-m_block, head_idx, batch_idx, _
+TileScheduler = SingleTileLPTScheduler
 ```
 
-对每个 work tile：
+它会反转 block 顺序，优先处理后面的 Q block，因为后面的 Q block 可见更多 K/V，工作量更重。
 
-1. 构造当前 batch 的 seqlen 信息。
-2. 找到 Q head 对应的 KV head：
-   - 普通 GQA: `head_idx_kv = head_idx // qhead_per_kvhead`
-   - pack GQA: `head_idx_kv = head_idx`
-3. 构造 Q/K/V 的 global tile view。
-4. 构造 TMA copy closure 或 cp.async manager。
-5. 根据 causal/local/block sparse 决定 N block 访问范围。
+## 4. Producer: `load`
 
-### 9.1 N block 方向
-
-非 block-sparse 主路径：
+producer 路径源码入口：
 
 ```python
-n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-n_block = n_block_max - 1
+if warp_idx < 4:
+    setmaxregister_decrease(self.num_producer_regs)
+    self.load(...)
 ```
 
-也就是从右往左扫描 K/V block：
+`load` 的核心任务：
 
 ```text
-n_block_max - 1, n_block_max - 2, ..., n_block_min
+对每个 work tile:
+    1. 根据 scheduler 得到 m_block/head/batch
+    2. load Q tile 到 sQ
+    3. 根据 causal/local 得到 n_block range
+    4. 按从右到左的顺序 load K/V tiles 到 sK/sV pipeline stages
+    5. 如果 paged TMA，查 page_table 得到 physical page_idx
+    6. 如果 non-TMA paged，使用 PagedKVManager 逐行查 page table 并 cp.async
 ```
 
-原因：
+### 4.1 哪些 warp 负责 load
 
-- causal/local mask 通常右侧边界更关键。
-- 第一块常常需要处理 seqlen/casual 边界 mask。
-- 右到左扫描方便和现有 online softmax/mask 区域划分配合。
+源码：
 
-### 9.2 第一轮 load
+```python
+warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+tidx, _, _ = cute.arch.thread_idx()
 
-第一轮会先发起：
+is_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV or not self.use_tma_Q)
+is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
+```
+
+含义：
 
 ```text
-K[n_block_max - 1] -> sK[stage]
-Q[m_block]         -> sQ
+TMA Q/KV path:
+    producer WG 的 warp 0 发 TMA。
+
+cp.async fallback:
+    需要更多 producer threads 参与普通 async copy。
 ```
 
-然后根据模式加载 V。
+本 case Q/K/V 都走 TMA：
 
-TMA Q：
+```text
+is_load_warp = warp_idx_in_wg == 0
+is_kv_load_warp = warp_idx_in_wg == 0
+```
+
+### 4.2 producer pipeline state
+
+源码：
+
+```python
+q_producer_phase = Int32(1)
+kv_producer_state = pipeline.make_pipeline_state(
+    pipeline.PipelineUserType.Producer,
+    self.num_stages,
+)
+
+tile_scheduler = TileSchedulerCls()
+work_tile = tile_scheduler.initial_work_tile_info()
+```
+
+K/V 使用 `num_stages=2` 的 pipeline state：
+
+```text
+stage 0
+stage 1
+stage 0
+stage 1
+...
+```
+
+Q 只有 1 stage，但使用 phase bit 来区分 full/empty barrier 的交替。
+
+### 4.3 当前 work tile 的 Q/KV head
+
+源码：
+
+```python
+m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+seqlen = SeqlenInfoCls(batch_idx)
+
+mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+
+head_idx_kv = (
+    head_idx // self.qhead_per_kvhead
+    if const_expr(not self.pack_gqa)
+    else head_idx
+)
+```
+
+本 case `pack_gqa=True`，所以：
+
+```text
+head_idx_kv = head_idx
+```
+
+因为 pack GQA 后 scheduler 的 head 维已经是 KV head 视角。
+
+### 4.4 TMA load Q
+
+源码：
+
+```python
+if self.use_tma_Q:
+    gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+    load_Q, _, _ = copy_utils.tma_get_copy_fn(
+        tma_atom_Q,
+        0,
+        cute.make_layout(1),
+        gQ,
+        sQ,
+        single_stage=True,
+    )
+```
+
+`gQ` 是当前 CTA 对应的 global Q tile：
+
+```text
+gQ: [tile_m, tile_hdim] = [128, 128]
+```
+
+真正发起 TMA：
 
 ```python
 pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
@@ -314,481 +663,885 @@ load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
 q_producer_phase ^= 1
 ```
 
-cp.async Q：
+注意这里把 pipeline Q 的 full barrier 指针传给 TMA load。TMA copy 完成后会 arrive 到这个 barrier，consumer 等待它。
+
+### 4.5 TMA load K/V: non-paged 和 paged
+
+TMA path：
 
 ```python
-pack_gqa.load_Q(...)
-cp_async_commit_group()
-pipeline_q.producer_commit_w_index(0)
-q_producer_phase ^= 1
+if self.use_tma_KV:
+    if mPageTable is not None:
+        mK_cur = mK[None, None, head_idx_kv, None]
+        mV_cur = mV[None, None, head_idx_kv, None]
+        gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+        gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
+    else:
+        mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+        mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+        gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
+        gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
 ```
 
-### 9.3 K/V double buffer
-
-无 intra-wg overlap 或非 TMA KV：
+paged KV 下，`mK` 已经是：
 
 ```text
-load K[current stage]
-load V[current stage]
-advance stage
-load K[next stage]
-load V[next stage]
-advance stage
-...
+[page_size, dim, head_kv, num_pages]
 ```
 
-开启 `intra_wg_overlap` 且 KV 使用 TMA 时：
+所以：
 
 ```text
-先 load K[last]
-之后循环：
-    load K[next]
-    load V[previous]
-最后 load V[first]
+mK_cur = mK[:, :, head_idx_kv, :]
+gK = local_tile(..., (tile_n, tile_hdim), (0, 0, None))
 ```
 
-这种错位加载让 consumer 可以在某些阶段把下一轮 QK 和当前轮 PV 交叠起来。
+`None` 这一维保留 page 维，后面通过 `src_idx=page_idx` 选择 physical page。
 
-## 10. `load_KV`
-
-`load_KV` 封装了 K/V 的具体搬运。
-
-TMA 路径：
-
-```text
-tma_load_fn(src_idx=block 或 page_idx, producer_state=state)
-pipeline_kv.producer_commit(state)
-```
-
-cp.async paged KV 路径：
-
-```text
-paged_kv_manager.load_KV(...)
-cp_async_commit_group()
-pipeline_kv.producer_commit(state)
-```
-
-这里的 `producer_state.index` 对应 shared memory stage，也就是 `sK[:, :, stage]` 或 `sV[:, :, stage]`。
-
-## 11. MMA consumer 入口
-
-consumer 入口是 `FlashAttentionForwardSm90.mma`。
-
-每个 consumer warpgroup 通过 `warp_group_idx` 切出自己的 tiled MMA slice：
+创建 TMA load closure：
 
 ```python
-warp_group_idx = tidx // 128
-wg_mma_qk = tiled_mma_qk.get_slice(warpgroup_layout(warp_group_idx))
-wg_mma_pv = tiled_mma_pv.get_slice(warpgroup_layout(warp_group_idx))
-```
-
-对于 `tile_m=128`：
-
-```text
-WG0 负责 Q rows 0..63
-WG1 负责 Q rows 64..127
-```
-
-对于 `tile_m=192`：
-
-```text
-WG0 负责 Q rows 0..63
-WG1 负责 Q rows 64..127
-WG2 负责 Q rows 128..191
-```
-
-这就是 `atom_layout_mnk=(tile_m // 64, 1, 1)` 在这里的实际效果。
-
-## 12. QK WGMMA
-
-QK 的逻辑：
-
-```text
-acc_S = Q_tile @ K_tile^T
-```
-
-MMA 配置：
-
-```text
-A operand: Q, major K
-B operand: K, major K
-C/D: fp32 accumulator
-tiler_mn: (64, tile_n)
-```
-
-`partition_fragment_ABC` 会把 `sQ`、`sK` partition 成当前 warpgroup 的 WGMMA operand fragment：
-
-```python
-tSrQ, tSrK, acc_S = partition_fragment_ABC(
-    wg_mma_qk,
-    (tile_m, tile_n, tile_hdim),
-    sQ,
+tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
+    tma_atom_K,
+    0,
+    cute.make_layout(1),
+    gK,
     sK,
 )
+tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
+
+tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(
+    tma_atom_V,
+    0,
+    cute.make_layout(1),
+    gV,
+    sV,
+)
+tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
 ```
 
-执行时用：
+### 4.6 paged TMA 的 page table 映射
+
+在非 block sparse 路径里：
 
 ```python
-acc_S = mma_qk_fn(B_idx=state.index, wg_wait=-1)
-```
+n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+n_block = n_block_max - 1 if self.use_tma_KV else max(n_block_max - 1, 0)
 
-其中：
-
-- `B_idx=state.index` 选择当前 K pipeline stage。
-- `wg_wait=-1` 表示发起 WGMMA 后不立即等待所有 outstanding group，后面显式 `warpgroup.wait_group(...)`。
-
-底层对应 Hopper WGMMA 指令族，语义上是：
-
-```text
-wgmma.mma_async.sync.aligned.m64n{tile_n_part}k16...
-```
-
-CuTe 会根据 dtype、layout、tile_n、K 维循环生成具体 WGMMA 指令序列。K 维按 16 的粒度参与 Tensor Core MMA，所以 head dim 会 pad 到 16 的倍数。
-
-## 13. Score modifier 和 mask
-
-QK 得到 `acc_S` 后，会依次处理：
-
-1. 可选 `score_mod`。
-2. causal/local/seqlen mask。
-3. online softmax。
-
-mask 对象：
-
-```python
-AttentionMask(
-    tile_m,
-    tile_n,
-    window_size_left,
-    window_size_right,
-    qhead_per_kvhead_packgqa,
+page_idx = (
+    mPageTable[batch_idx, n_block]
+    if const_expr(mPageTable is not None and self.use_tma_KV)
+    else None
 )
 ```
 
-典型 mask 类型：
-
-- seqlen 越界 mask。
-- causal mask。
-- local window mask。
-- pack GQA 下的 head/tile 对齐 mask。
-
-被 mask 的 score 会写成 `-inf` 或等价极小值，使 softmax 后概率为 0。
-
-## 14. Online softmax
-
-每个 Q row 维护 softmax 状态：
-
-```text
-m_i = 当前扫描过 score 的 row max
-l_i = 当前扫描过 exp(score - m_i) 的 sum
-O_i = 当前已累计的输出
-```
-
-每处理一个 `S_tile`：
-
-```text
-m_new = max(m_old, max(S_tile))
-alpha = exp2(m_old - m_new)
-p = exp2(S_tile - m_new)
-l_new = l_old * alpha + sum(p)
-O = O * alpha + p @ V
-```
-
-源码中：
-
-- `softmax.online_softmax(...)` 更新 row max / row sum，并返回 `row_scale`。
-- `softmax.rescale_O(acc_O, row_scale)` 对旧的 O accumulator 做缩放。
-- 最后 `softmax.finalize(...)` 生成 LSE，并得到最终归一化需要的 scale。
-
-注意这里使用 `softmax_scale_log2`，因为底层常用 `exp2` 近似/指令路径：
-
-```text
-score * softmax_scale * log2(e)
-```
-
-## 15. P 的两种路径：RS 和 SMEM
-
-### 15.1 `mma_pv_is_rs=True`
-
-P 留在寄存器：
-
-```text
-acc_S fp32
-  -> softmax
-  -> convert to fp16/bf16 P fragment in register
-  -> PV WGMMA A operand comes from register
-```
-
-优点：
-
-- 避免 P 写 shared 再读 shared。
-- 对 head_dim 64/128 等配置很高效。
-
-代价：
-
-- register pressure 更高。
-- P fragment、O accumulator、softmax state 同时存在。
-
-### 15.2 `mma_pv_is_rs=False`
-
-P 写入 shared memory：
-
-```text
-acc_S fp32
-  -> softmax
-  -> convert to fp16/bf16
-  -> store sP
-  -> PV WGMMA 从 sP 读 A operand
-```
-
-通常用于某些 `head_dim <= 96` 且 tile 形状更适合 shared P 的路径。
-
-需要额外同步：
-
-```text
-PFull / PEmpty named barrier
-fence / sync before PV WGMMA consumes sP
-```
-
-## 16. PV WGMMA
-
-PV 的逻辑：
-
-```text
-acc_O += P_tile @ V_tile
-```
-
-MMA 配置：
-
-```text
-A operand: P, register 或 shared
-B operand: V^T shared view
-C/D: fp32 accumulator
-tiler_mn: (64, tile_hdimv)
-```
-
-V 在 shared 中原始 layout 是：
-
-```text
-sV: tile_n x tile_hdimv x num_stages
-```
-
-consumer 创建转置 view：
+然后：
 
 ```python
-sVt = transpose_view(sV)
+pipeline_k.producer_acquire(kv_producer_state)
+load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
 ```
 
-PV WGMMA 看到的是：
-
-```text
-V^T: tile_hdimv x tile_n
-```
-
-执行时：
+`load_KV` 里：
 
 ```python
-mma_pv_fn(B_idx=state.index, wg_wait=0 或 -1)
+if self.use_tma_KV:
+    src_idx = block if const_expr(page_idx is None) else page_idx
+    tma_load_fn(src_idx=src_idx, producer_state=producer_state)
+else:
+    paged_kv_manager.load_KV(...)
+    cp_async_commit_group()
+pipeline_kv.producer_commit(producer_state)
 ```
 
-同样通过 `B_idx` 选择 V 的 pipeline stage。
-
-## 17. Mainloop 的三种消费函数
-
-SM90 consumer 里有几个关键函数。
-
-### 17.1 `mma_one_n_block`
-
-普通一块 N block 的顺序：
+所以 paged TMA 的完整含义是：
 
 ```text
-wait K
-QK WGMMA
-wait QK done
-release K
-score_mod / mask
-online softmax
-S -> P
-rescale O
-wait V
-PV WGMMA
-release V
-advance pipeline state
+logical n_block
+  -> page_idx = page_table[batch, n_block]
+  -> tma_load_fn(src_idx=page_idx)
+  -> 从 physical page 读一个 [tile_n, head_dim] tile
+  -> 写入 sK/sV 的当前 pipeline stage
 ```
 
-这是最容易理解的标准路径。
+本 case `page_size=tile_n=128`，所以一个 logical n_block 正好对应一个 page。
 
-### 17.2 `first_half_block_overlap` / `last_half_block_overlap`
+### 4.7 producer 的 K/V overlap load 顺序
 
-用于 intra-wg overlap 的边界处理。
-
-因为交叠需要前后两个 N block 的 K/V 都有合适的 pipeline 状态，第一块和最后一块要拆开处理：
+本 case：
 
 ```text
-first_half:
-    wait K
-    QK
-    softmax
-    准备 P
-
-last_half:
-    wait V
-    PV
+intra_wg_overlap=True
+use_tma_KV=True
 ```
 
-### 17.3 `mma_one_n_block_intrawg_overlap`
+producer 会进入 overlap 分支：
 
-核心交叠路径：
+```python
+for i in range(n_block_max - 1 - n_block_min):
+    n_block_prev = n_block_max - i - 1
+    n_block = n_block_prev - 1
+
+    page_idx = mPageTable[batch_idx, n_block]
+    page_idx_prev = mPageTable[batch_idx, n_block_prev]
+
+    kv_producer_state_prev = kv_producer_state.clone()
+    kv_producer_state.advance()
+
+    pipeline_k.producer_acquire(kv_producer_state)
+    load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+
+    pipeline_v.producer_acquire(kv_producer_state_prev)
+    load_V(block=n_block_prev, producer_state=kv_producer_state_prev, page_idx=page_idx_prev)
+```
+
+这段看起来有点绕，但目标是让 producer 提前形成：
 
 ```text
-current V state = 当前 block
-next K state    = 下一 block
-
-wait K[next]
-launch QK[next]
-
-wait V[current]
-launch PV[current]
-
-wait QK partly/all
-release K[next]
-score/mask/softmax for next
-
-wait PV
-release V[current]
-prepare P[next]
+K(next) 和 V(current) 错位加载
 ```
 
-也就是把：
+对应 consumer 侧：
 
 ```text
-QK(next block)
-PV(current block)
+QK(next) overlap PV(current)
 ```
 
-在同一 consumer warpgroup 内尽量重叠。
-
-这要求 producer 端 K/V load 也错位：
-
-```text
-load K[next] before load V[current]
-```
-
-## 18. Mainloop 区域划分
-
-非 block-sparse 路径按 mask 情况把 N block 分成几个区域。
-
-典型顺序：
-
-1. 最右侧 first block：经常需要 seqlen mask。
-2. causal/local mask 区域：需要每个元素判断是否可见。
-3. 中间 no-mask 区域：可以省掉 mask 分支，性能最好。
-4. local 左边界区域：local attention 下还需要左窗口 mask。
-
-这种划分的目标是：
-
-- 只在需要的时候应用复杂 mask。
-- 对完全可见的 N block 走更轻的路径。
-- 保持 online softmax 的扫描顺序一致。
-
-## 19. Epilogue：O 和 LSE 写回
-
-Epilogue 在基类 `FlashAttentionForwardBase.epilogue`。
-
-步骤：
-
-1. `acc_O fp32 -> rO fp16/bf16`
-2. consumer threads 到达 `NamedBarrierFwd.Epilogue`
-3. `rO -> sO`
-4. 写 LSE 到 global
-5. `sO -> O global`
-
-### 19.1 O 写回为什么经过 shared
-
-即使 O 已经在寄存器里，kernel 仍然先把 O 写到 `sO`：
-
-```text
-register accumulator
-  -> shared memory sO
-  -> global memory O
-```
-
-原因：
-
-- TMA store 要从 shared memory 到 global memory。
-- 即使非 TMA store，也可以通过 shared staging 做更规整的 vectorized global copy。
-
-### 19.2 TMA store O
-
-TMA O store 使用：
-
-```text
-CopyBulkTensorTileS2GOp
-```
-
-大致顺序：
-
-```text
-fence_view_async_shared
-barrier_arrive(Epilogue)
-warp_idx == 4 发起 store_O()
-cp_async_bulk_commit_group()
-cp_async_bulk_wait_group(0, read=True)
-```
-
-这里 `warp_idx == 4` 是第一个 consumer warpgroup 的第一个 warp，用它来发起 TMA store。
-
-### 19.3 LSE 写回
-
-LSE 是每个 Q row 一个 fp32 值。写回时只让对应 column 0 的 thread 写，避免重复写。
-
-pack GQA 情况下通过 `PackGQA.store_LSE` 处理 M 维里打包的多个 Q head。
-
-## 20. 一次 CTA 的完整时间线
-
-```text
-kernel entry
-  |
-  | warp 0 prefetch TMA descriptors
-  | allocate shared storage
-  | create pipeline_q/k/v
-  | initialize barriers
-  v
-producer WG                         consumer WGs
------------                         ------------
-load Q tile
-load K last block
-load V last block      --->         wait Q/K
-                                    QK WGMMA
-                                    mask + online softmax
-                                    P prepare
-                                    wait V
-                                    PV WGMMA
-
-prefetch next K/V      --->         consume next N block
-...
-producer tail                       finalize softmax
-                                    rescale O
-                                    epilogue store O/LSE
-```
-
-开启 intra-wg overlap 后，中间部分更接近：
+稳定态可以理解成：
 
 ```text
 producer:
-    load K[i-1]
-    load V[i]
+    load K block j-1
+    load V block j
 
 consumer:
-    QK[i-1] overlaps PV[i]
+    QK block j-1
+    PV block j
 ```
 
-## 21. 分块和资源的具体例子
+因为 causal mainloop 从右往左扫 K blocks，所以这里的 next/current 在源码上表现为 `n_block_prev` 和 `n_block`。
 
-### 21.1 head_dim=128
+## 5. Consumer: `mma`
 
-典型配置：
+consumer 路径源码入口：
+
+```python
+else:  # Consumer
+    setmaxregister_increase(self.num_mma_regs)
+    tidx = thread_idx - 128
+    self.mma(...)
+```
+
+注意 `tidx = tidx - 128`，因为 consumer 的 thread indexing 从 producer 之后开始重新编号。
+
+### 5.1 MMA thread slice 和 fragment partition
+
+源码：
+
+```python
+warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+warp_group_thread_layout = cute.make_layout(
+    self.num_wg_mma,
+    stride=self.num_threads_per_warp_group,
+)
+
+thr_mma_qk = tiled_mma_qk.get_slice(tidx)
+wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
+wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
+```
+
+本 case：
+
+```text
+num_wg_mma = 2
+warp_group_idx = 0 or 1
+```
+
+每个 consumer WG 拿到自己的 Q rows：
+
+```text
+WG 0: Q tile 的前 64 rows
+WG 1: Q tile 的后 64 rows
+```
+
+QK fragment partition：
+
+```python
+_, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+    wg_mma_qk,
+    (self.tile_m, self.tile_n, self.tile_hdim),
+    sQ,
+    sK,
+)
+
+mma_qk_fn = partial(
+    sm90_utils.gemm_zero_init,
+    tiled_mma_qk,
+    (self.tile_m, self.tile_n),
+    tSrQ,
+    tSrK,
+)
+```
+
+PV fragment partition：
+
+```python
+acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
+    wg_mma_pv,
+    (self.tile_m, self.tile_hdimv, self.tile_n),
+    sP,
+    sVt,
+)
+
+mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
+```
+
+本 case `sP=None` 且 `mma_pv_is_rs=True`，所以 `tOrP` 对应 register source fragment，P 不落 shared。
+
+### 5.2 Softmax 状态
+
+源码：
+
+```python
+softmax = Softmax.create(
+    softmax_scale_log2,
+    num_rows=acc_O.shape[0][0] * acc_O.shape[1],
+    softmax_scale=softmax_scale,
+)
+```
+
+`Softmax.create`：
+
+```python
+row_max = cute.make_rmem_tensor(num_rows, Float32)
+row_sum = cute.make_rmem_tensor(num_rows, Float32)
+```
+
+每个 consumer thread 持有自己负责的若干 rows 的：
+
+```text
+row_max
+row_sum
+```
+
+这些状态贯穿多个 K/V n_blocks，用于 online softmax。
+
+### 5.3 Work tile 循环
+
+consumer 主循环：
+
+```python
+tile_scheduler = TileSchedulerCls()
+work_tile = tile_scheduler.initial_work_tile_info()
+
+while work_tile.is_valid_tile:
+    m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+    seqlen = SeqlenInfoCls(batch_idx)
+    mask = AttentionMaskCls(seqlen)
+    ...
+    n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+    pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
+    ...
+    mainloop over n_blocks
+    ...
+    pipeline_q.consumer_release_w_index(0)
+    ...
+    finalize softmax
+    epilogue
+    tile_scheduler.advance_to_next_work()
+```
+
+consumer 先等 Q：
+
+```python
+pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
+```
+
+这保证 producer 的 Q TMA 已经完成，`sQ` 可以被 QK WGMMA 读取。
+
+## 6. Mainloop: 从右往左扫 K/V blocks
+
+### 6.1 为什么从右往左
+
+non-block-sparse 主路径：
+
+```python
+n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+
+if self.intra_wg_overlap:
+    process_first_half_block(n_block=n_block_max - 1, ...)
+...
+n_block_max -= 1
+
+for n_tile in range(...):
+    n_block = n_block_max - 1 - n_tile
+    mma_one_n_block(...)
+```
+
+也就是从 `n_block_max - 1` 往 `n_block_min` 扫。
+
+原因包括：
+
+```text
+1. causal 下右侧边界块通常需要 mask。
+2. 先处理最右侧块，可以把 seqlen/causal mask 逻辑单独拿出来。
+3. intra_wg_overlap 需要 first half / last half 拆分，
+   从右往左可以配合 producer 的 K(next)/V(current) 错位加载。
+```
+
+### 6.2 三类 n_block
+
+mainloop 把 n_blocks 分成几类：
+
+```text
+1. first iteration:
+   最右侧 n_block，通常需要 seqlen mask，也可能需要 causal mask。
+
+2. causal/local mask iterations:
+   causal 或 local 边界区域，需要 mask。
+
+3. no-mask iterations:
+   完全可见的 K/V blocks，不需要 causal/local/seqlen mask。
+
+4. local-left mask iterations:
+   local attention 左边界，本文 case 不涉及。
+```
+
+源码结构：
+
+```python
+# first iteration
+process_first_half_block(n_block=n_block_max - 1, mask_seqlen=True)
+n_block_max -= 1
+
+# causal/local masked iterations
+if self.is_causal or self.is_local:
+    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(...)
+    for n_tile in range(n_block_max - n_block_min_causal_local_mask):
+        mma_one_n_block(..., mask_seqlen=False)
+    n_block_max = min(n_block_max, n_block_min_causal_local_mask)
+
+# no-mask iterations
+n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(...)
+for n_tile in range(n_block_max - n_block_min_before_local_mask):
+    mma_one_n_block(..., mask_seqlen=False)
+```
+
+这种拆分的收益：
+
+```text
+尽可能让中间大量 full blocks 走无 mask 快路径；
+只在边界 blocks 做 mask。
+```
+
+## 7. QK、mask、online softmax、PV
+
+### 7.1 非 overlap 版本: `mma_one_n_block`
+
+源码主干：
+
+```python
+pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+
+# S = Q @ K.T
+acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+self.warp_scheduler_barrier_arrive()
+warpgroup.wait_group(0)
+pipeline_k.consumer_release(smem_pipe_read)
+
+if score_mod_fn is not None:
+    score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+if mask_fn is not None:
+    mask_fn(acc_S=acc_S, n_block=n_block)
+
+row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
+
+tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+tOrP_cur = tOrP if self.mma_pv_is_rs else make_rmem_tensor_like(...)
+utils.cvt_f16(tOrP_acc, tOrP_cur)
+
+if not self.mma_pv_is_rs:
+    copy P to sP
+
+softmax.rescale_O(acc_O, row_scale)
+
+pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+self.warp_scheduler_barrier_sync()
+
+# O += P @ V
+mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
+pipeline_v.consumer_release(smem_pipe_read)
+smem_pipe_read.advance()
+```
+
+语义：
+
+```text
+1. 等 K stage 可读。
+2. QK WGMMA 得到 acc_S。
+3. 对 acc_S 做 score_mod 和 mask。
+4. online softmax，把 acc_S 原地变成 P。
+5. 根据 row_scale rescale 历史 acc_O。
+6. 等 V stage 可读。
+7. PV WGMMA，把 P @ V 累加到 acc_O。
+```
+
+### 7.2 overlap 版本: `first_half_block_overlap`
+
+开启 `intra_wg_overlap=True` 时，mainloop 被拆成 first half、middle overlap、last half。
+
+first half：
+
+```python
+pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+pipeline_k.consumer_release(kv_consumer_state)
+
+if score_mod_fn is not None:
+    score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+
+mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+
+row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
+
+tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+tOrP_cur = tOrP if self.mma_pv_is_rs else make_rmem_tensor_like(...)
+tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+```
+
+它只完成：
+
+```text
+QK(first)
+mask
+online softmax
+准备 P
+```
+
+不做 PV。PV 会在下一步和后续 QK 交叠。
+
+### 7.3 overlap 稳定态: `mma_one_n_block_intrawg_overlap`
+
+源码主干：
+
+```python
+smem_pipe_read_v = smem_pipe_read.clone()
+smem_pipe_read.advance()
+
+pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+self.warp_scheduler_barrier_sync()
+
+# S(next) = Q @ K(next).T
+acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+
+if self.rescale_O_before_gemm:
+    softmax.rescale_O(acc_O, scores_scale)
+
+pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
+
+# O += P(current) @ V(current)
+mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+
+self.warp_scheduler_barrier_arrive()
+warpgroup.wait_group(1)
+pipeline_k.consumer_release(smem_pipe_read)
+
+if score_mod_fn is not None:
+    score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+if mask_fn is not None:
+    mask_fn(acc_S=acc_S, n_block=n_block)
+
+row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+
+warpgroup.wait_group(0)
+pipeline_v.consumer_release(smem_pipe_read_v)
+
+tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+utils.cvt_f16(tOrP_acc, tOrP_cur)
+
+if not self.rescale_O_before_gemm:
+    softmax.rescale_O(acc_O, row_scale)
+else:
+    scores_scale.store(row_scale.load())
+```
+
+这段的核心是：
+
+```text
+QK(next) 和 PV(current) 同时在飞。
+```
+
+时间线可以理解为：
+
+```text
+已有:
+    P(current) 已经由上一次 QK + softmax 准备好。
+
+本次:
+    1. 发起 QK(next)
+    2. 等 V(current)
+    3. 发起 PV(current)
+    4. 等 QK(next) 完成
+    5. 对 S(next) 做 mask/softmax，准备 P(next)
+    6. 等 PV(current) 完成
+```
+
+所以一轮结束后：
+
+```text
+acc_O 已经累加了 current block 的贡献；
+P(next) 已经准备好，留给下一轮 PV。
+```
+
+### 7.4 overlap last half
+
+最后一个 half block：
+
+```python
+if self.rescale_O_before_gemm:
+    softmax.rescale_O(acc_O, scores_scale)
+
+pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
+pipeline_v.consumer_release(kv_consumer_state)
+kv_consumer_state.advance()
+```
+
+作用：
+
+```text
+把 first/middle 准备好的最后一个 P block 对应的 PV 做完。
+```
+
+这解释了为什么 overlap path 需要：
+
+```text
+first_half: QK + softmax only
+middle: QK(next) overlap PV(current)
+last_half: PV(last)
+```
+
+## 8. Online Softmax 实现
+
+FlashAttention 的核心不是先 materialize 全部 S，再 softmax，而是对每个 K/V tile 做 online softmax。
+
+### 8.1 状态
+
+`Softmax` 类：
+
+```python
+@dataclass
+class Softmax:
+    scale_log2: Float32
+    num_rows: Constexpr[int]
+    row_max: cute.Tensor
+    row_sum: cute.Tensor
+    softmax_scale: Float32 | None = None
+```
+
+创建：
+
+```python
+row_max = cute.make_rmem_tensor(num_rows, Float32)
+row_sum = cute.make_rmem_tensor(num_rows, Float32)
+```
+
+对每个 Q row，online softmax 维护：
+
+```text
+m_i = 当前已处理 blocks 的最大 score
+l_i = 当前已处理 blocks 的 exp sum
+acc_O_i = 当前已处理 blocks 的未归一化 O 累积
+```
+
+### 8.2 `online_softmax`
+
+源码核心：
+
+```python
+acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+row_scale = make_fragment_like(self.row_max, Float32)
+
+for r in range(size(row_max)):
+    acc_S_row = acc_S_mn[r, None].load()
+
+    row_max_cur = fmax_reduce(
+        acc_S_row,
+        init_val=row_max[r] if not is_first else None,
+    )
+    row_max_cur = warp_reduction_max(row_max_cur, threads_in_group=4)
+
+    row_max_prev = row_max[r]
+    row_max[r] = row_max_cur
+
+    if check_inf:
+        row_max_cur = 0.0 if row_max_cur == -inf else row_max_cur
+
+    acc_S_row_exp = exp2(acc_S_row * scale_log2 - row_max_cur * scale_log2)
+
+    if is_first:
+        acc_S_row_sum = fadd_reduce(acc_S_row_exp)
+        row_scale[r] = 1.0
+    else:
+        row_scale[r] = exp2((row_max_prev - row_max_cur) * scale_log2)
+        acc_S_row_sum = fadd_reduce(
+            acc_S_row_exp,
+            init_val=row_sum[r] * row_scale[r],
+        )
+
+    row_sum[r] = acc_S_row_sum
+    acc_S_mn[r, None].store(acc_S_row_exp)
+
+return row_scale
+```
+
+数学对应：
+
+```text
+m_new = max(m_old, max(S_block))
+p_block = exp(S_block - m_new)
+scale_old = exp(m_old - m_new)
+l_new = l_old * scale_old + sum(p_block)
+O_old *= scale_old
+O_new = O_old + p_block @ V_block
+```
+
+源码里 `acc_S` 被原地改成 `exp(score - row_max)`，也就是 P block。
+
+`row_scale` 用于 rescale 旧的 `acc_O`：
+
+```python
+softmax.rescale_O(acc_O, row_scale)
+```
+
+### 8.3 为什么用 `scale_log2`
+
+`compute_softmax_scale_log2` 在 kernel 前把 scale 转成 log2 形式。kernel 内：
+
+```python
+exp2(acc_S_row * scale_log2 - row_max_cur_scaled)
+```
+
+这样可以用 `exp2` fast path。
+
+数学上：
+
+```text
+exp(x * softmax_scale)
+= exp2(x * softmax_scale * log2(e))
+```
+
+所以 `scale_log2 = softmax_scale * log2(e)`。
+
+### 8.4 finalize
+
+所有 N blocks 处理完后：
+
+```python
+row_scale = softmax.finalize(sink_val=sink_val)
+softmax.rescale_O(acc_O, row_scale)
+```
+
+`finalize`：
+
+```python
+row_sum.store(warp_reduce(row_sum.load(), operator.add, width=4))
+
+for r in range(size(row_sum)):
+    row_scale[r] = rcp_approx(row_sum[r]) * final_scale
+    row_sum[r] = (
+        (row_max[r] * scale_log2 + log2(row_sum_cur)) * ln(2)
+        if valid
+        else -inf
+    )
+return row_scale
+```
+
+最终：
+
+```text
+acc_O *= 1 / row_sum
+LSE = row_max * scale_log2 * ln(2) + log(row_sum)
+```
+
+注意 `row_sum` 在 finalize 后被改写成 LSE。
+
+## 9. Mask 实现和 chunked prefill causal offset
+
+### 9.1 causal offset
+
+chunked prefill：
+
+```text
+cached prefix = 2048
+current chunk = 1024
+visible KV = 3072
+```
+
+对当前 chunk 内局部 query index `q_local`：
+
+```text
+global_q_pos = q_local + (seqlen_k - seqlen_q)
+             = q_local + 2048
+```
+
+causal 条件：
+
+```text
+k_idx <= global_q_pos
+```
+
+源码中这个 offset 反复以：
+
+```python
+seqlen_k - seqlen_q
+```
+
+的形式出现。
+
+`BlockInfo.get_n_block_min_max` 里：
+
+```python
+n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+n_block_max = min(n_block_max, ceil_div(n_idx, tile_n))
+```
+
+`AttentionMask.apply_mask` 里有类似：
+
+```python
+causal_row_offset = (
+    1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
+)
+```
+
+这类表达式都是在把当前 block 内局部 row/col 坐标映射到全局 causal 可见性。
+
+### 9.2 为什么要分 block range 和 element mask
+
+FlashAttention 先用 `BlockInfo` 粗粒度裁剪 n_blocks：
+
+```text
+完全在未来的 K/V blocks 不进入 mainloop。
+```
+
+然后对边界 block 用 `AttentionMask` 细粒度 mask：
+
+```text
+同一个 128-column tile 内，有些列可见，有些列不可见。
+不可见的 score 写成 -inf。
+```
+
+两层结合：
+
+```text
+block-level skipping:
+    少加载、少计算完全无效 K/V blocks。
+
+element-level masking:
+    正确处理 causal/local/seqlen 边界。
+```
+
+## 10. Epilogue: 写 O 和 LSE
+
+SM90 forward 使用基类 `FlashAttentionForwardBase.epilogue`。
+
+### 10.1 acc_O 到 shared memory
+
+源码：
+
+```python
+rO = cute.make_fragment_like(acc_O, self.dtype)
+rO.store(acc_O.load().to(self.dtype))
+
+cute.arch.barrier(
+    barrier_id=int(NamedBarrierFwd.Epilogue),
+    number_of_threads=self.num_epilogue_threads,
+)
+
+smem_copy_atom_O = utils.get_smem_store_atom(...)
+smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
+taccOrO = smem_thr_copy_O.retile(rO)
+taccOsO = smem_thr_copy_O.partition_D(sO)
+cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
+```
+
+这一步把 consumer register accumulator 中的 `acc_O` 转成 bf16，并写入 `sO`。
+
+为什么不直接每个 thread 写 global：
+
+```text
+acc_O 的 fragment layout 是 WGMMA accumulator layout。
+写 global 需要更规整的 layout 和更好的 vectorization。
+所以先通过 smem copy atom 写入 sO，再由 TMA 或 gmem copy 写回 O。
+```
+
+### 10.2 写 LSE
+
+源码：
+
+```python
+if mLSE is not None:
+    mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
+    if not self.pack_gqa:
+        gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
+        ...
+        if taccOcO[0][1] == 0:
+            for m in range(...):
+                if valid row:
+                    taccOgLSE[m, 0] = lse[m]
+    else:
+        pack_gqa.store_LSE(...)
+```
+
+只有对应 column 0 的 thread 写 LSE，因为每行只需要一个 LSE 值。
+
+本 case如果 `return_lse=False` 且不需要 backward，`mLSE=None`，这一段跳过。
+
+### 10.3 写 O: TMA path
+
+本 case `use_tma_O=True`：
+
+```python
+if self.use_tma_O:
+    cute.arch.fence_view_async_shared()
+    cute.arch.barrier_arrive(
+        barrier_id=int(NamedBarrierFwd.Epilogue),
+        number_of_threads=self.num_epilogue_threads + WARP_SIZE,
+    )
+    gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+    store_O, _, _ = copy_utils.tma_get_copy_fn(
+        tma_atom_O,
+        0,
+        cute.make_layout(1),
+        sO,
+        gO,
+        single_stage=True,
+    )
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    if warp_idx == 4:
+        cute.arch.barrier(...)
+        store_O()
+        cp_async_bulk_commit_group()
+        cp_async_bulk_wait_group(0, read=True)
+```
+
+这里由 consumer 区域中的一个 warp 发起 TMA store。`sO` 已经由所有 consumer threads 写好，所以先 fence + barrier，再发 TMA S2G。
+
+如果不能走 TMA O，则 fallback 到普通 tiled copy：
+
+```python
+gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+...
+cute.copy(gmem_tiled_copy_O, tOrO, tOgO, pred=...)
+```
+
+## 11. Qwen Case 代入: 一个 work tile 发生了什么
+
+现在把上面的源码执行流代入本 case。
+
+### 11.1 静态配置
+
+进入 kernel 前已经确定：
 
 ```text
 tile_m = 128
@@ -796,178 +1549,399 @@ tile_n = 128
 tile_hdim = 128
 tile_hdimv = 128
 num_stages = 2
-MMA WGs = 2
-threads = 384
+num_threads = 384
+num_wg_mma = 2
+use_tma_Q = True
+use_tma_KV = True
+use_tma_O = True
+mma_pv_is_rs = True
+intra_wg_overlap = True
+pack_gqa = True
+qhead_per_kvhead = 7
+TileScheduler = SingleTileLPTScheduler
 ```
 
-shared memory 近似：
+shared memory：
 
 ```text
-sQ = 128 * 128 * 2 bytes = 32 KB
-sK = 128 * 128 * 2 stages * 2 bytes = 64 KB
-sV = 128 * 128 * 2 stages * 2 bytes = 64 KB
-total ~= 160 KB
+sQ: 128 x 128
+sK: 128 x 128 x 2
+sV: 128 x 128 x 2
+sO: 128 x 128, reusing sQ storage
+sP: none
 ```
 
-每个 consumer warpgroup 处理 64 行 Q：
+MMA：
 
 ```text
-QK: 64 x 128 output score tile
-PV: 64 x 128 output O tile
+QK:
+    each consumer WG: [64,128] x [128,128]^T -> [64,128]
+
+PV:
+    each consumer WG: [64,128] x [128,128] -> [64,128]
 ```
 
-如果 `mma_pv_is_rs=True`，P 不落 shared，寄存器压力较大但少一次 shared memory 往返。
+### 11.2 scheduler 选中一个 tile
 
-### 21.2 head_dim=64
-
-典型配置：
+假设 scheduler 选到：
 
 ```text
-tile_m = 192
-tile_n = 128
-tile_hdim = 64
-num_stages = 2
-MMA WGs = 3
-threads = 512
+m_block = 7
+head_idx = 0
+batch_idx = 0
 ```
 
-shared memory 近似：
+因为 LPT 会优先处理后面的 block，`m_block=7` 是当前 chunk 的最后 128 个 Q rows。
+
+局部 Q rows：
 
 ```text
-sQ = 192 * 64 * 2 = 24 KB
-sK = 128 * 64 * 2 * 2 = 32 KB
-sV = 128 * 64 * 2 * 2 = 32 KB
-total ~= 88 KB
+q_local = 896..1023
 ```
 
-因为 headdim 小，shared memory 和寄存器压力都较低，所以可以把 `tile_m` 做到 192，提高每个 CTA 的 Q rows 工作量。
-
-### 21.3 head_dim=256
-
-典型配置：
+全局位置：
 
 ```text
-tile_m = 128
-tile_n = 64 或 80
-tile_hdim = 256
-num_stages = 2
-MMA WGs = 2
-threads = 384
+q_global = 2048 + q_local
+         = 2944..3071
 ```
 
-如果 `tile_n=64`：
+所以这个 Q block 可以看几乎所有 K：
 
 ```text
-sQ = 128 * 256 * 2 = 64 KB
-sK = 64 * 256 * 2 * 2 = 64 KB
-sV = 64 * 256 * 2 * 2 = 64 KB
-total ~= 192 KB
+K visible up to 3071
 ```
 
-这已经接近 shared memory 压力较大的区域，所以 N block 需要缩小。
-
-## 22. Hopper 指令层要点
-
-### 22.1 TMA bulk copy
-
-语义：
+`seqlen.seqlen_k=3072`，`tile_n=128`：
 
 ```text
-global tensor tile -> shared tensor tile
-shared tensor tile -> global tensor tile
+total K blocks = 24
 ```
 
-对应 Hopper 的 bulk tensor copy 能力，CuTe 用：
+`BlockInfo.get_n_block_min_max` 大致得到：
 
 ```text
-cpasync.CopyBulkTensorTileG2SOp
-cpasync.CopyBulkTensorTileS2GOp
+n_block_min = 0
+n_block_max = 24
 ```
 
-并通过 memory barrier 和 pipeline state 交接。
-
-### 22.2 WGMMA
-
-语义：
+mainloop 从：
 
 ```text
-wgmma.mma_async
+n_block = 23
 ```
 
-QK：
+开始往左扫到 0。
+
+### 11.3 producer 对这个 tile 做什么
+
+1. load Q：
 
 ```text
-fp16/bf16 Q shared
-fp16/bf16 K shared
-fp32 accumulator S
+gQ = Q[m_block=7, head_idx=0, batch=0]
+shape = [128,128]
+TMA -> sQ
 ```
 
-PV：
+2. load 最右侧 K：
 
 ```text
-fp16/bf16 P register/shared
-fp16/bf16 V shared
-fp32 accumulator O
+n_block = 23
+page_idx = page_table[0, 23]
+TMA K page_idx -> sK[..., stage 0]
 ```
 
-Hopper WGMMA 是 warpgroup 级别，即 128 threads 协作执行。kernel 的 `warpgroup.wait_group(0/1)` 用来等待 outstanding WGMMA group 完成。
-
-### 22.3 cp.async fallback
-
-非 TMA load 使用：
+3. overlap preload：
 
 ```text
-cp.async global.shared
-cp_async_commit_group
-pipeline producer commit
+load K block 22 -> stage 1
+load V block 23 -> stage 0
+load K block 21 -> stage 0
+load V block 22 -> stage 1
+...
 ```
 
-copy 粒度是 128-bit。
-
-## 23. 和 Ampere 写法的关键区别
-
-本文不展开 Ampere，但为了理解 Hopper，这里只列必要差异：
-
-- Hopper 使用 WGMMA，计算单位是 128-thread warpgroup；Ampere 常见是 warp-level MMA。
-- Hopper 主路径使用 TMA bulk tensor copy；Ampere 主要依赖 cp.async tiled copy。
-- Hopper 使用 producer-consumer warpgroup specialization；Ampere 更常见同一批 warp 做 load+compute 的 software pipeline。
-- Hopper 用 memory barrier/pipeline 同步 TMA 和 WGMMA consumer。
-
-## 24. 阅读源码的定位表
-
-| 想看什么 | 入口 |
-| --- | --- |
-| tile_m/tile_n 怎么来 | `interface.py::_tile_size_fwd_sm90` |
-| tiled MMA 怎么创建 | `flash_fwd_sm90.py::_get_tiled_mma` |
-| shared storage 有哪些 tensor | `flash_fwd_sm90.py::_get_shared_storage_cls` |
-| TMA/cp.async copy atom | `flash_fwd.py::_setup_attributes` 和 `flash_fwd_sm90.py::__call__` |
-| kernel producer/consumer 分流 | `flash_fwd_sm90.py::kernel` |
-| Q/K/V load 顺序 | `flash_fwd_sm90.py::load` |
-| 单个 K/V block 怎么算 | `flash_fwd_sm90.py::mma_one_n_block` |
-| intra-wg overlap | `flash_fwd_sm90.py::mma_one_n_block_intrawg_overlap` |
-| O/LSE 写回 | `flash_fwd.py::epilogue` |
-
-## 25. 最短心智模型
-
-Hopper FlashAttention forward 可以浓缩成：
+producer 的核心节奏是：
 
 ```text
-一个 CTA 处理一个 Q block x 一个 head x 一个 batch。
+K(next) / V(current) 错位进入 shared pipeline
+```
 
-producer warpgroup:
-    用 TMA/cp.async 把 Q/K/V tile 搬到 shared memory。
-    Q 单 stage，K/V 双 stage。
+### 11.4 consumer 对这个 tile 做什么
 
-consumer warpgroups:
-    每个 warpgroup 负责 64 行 Q。
-    QK 用 WGMMA 得到 score。
-    score 在寄存器中 mask + online softmax。
-    P 留寄存器或写 shared。
-    PV 用 WGMMA 累加 O。
+consumer 先等 Q：
+
+```text
+wait pipeline_q full
+```
+
+然后 first half：
+
+```text
+wait K block 23
+QK block 23
+mask block 23
+online softmax, is_first=True
+生成 P block 23, 留在 register
+```
+
+对 `m_block=7`，`n_block=23` 是 causal 边界 block。虽然这个 Q block 是最后一个 block，大部分可见，但 block 内仍然要对未来列做精细 mask。
+
+中间 overlap 稳定态：
+
+```text
+QK block 22 overlaps PV block 23
+softmax block 22 prepares P block 22
+
+QK block 21 overlaps PV block 22
+softmax block 21 prepares P block 21
+
+...
+```
+
+每处理一个新 block，online softmax 更新：
+
+```text
+row_max
+row_sum
+row_scale
+```
+
+并用 `row_scale` rescale 旧的 `acc_O`，保持数值正确。
+
+最后 last half：
+
+```text
+PV block 0
+```
+
+然后 finalize：
+
+```text
+acc_O *= 1 / row_sum
+row_sum -> LSE
+```
+
+最后 epilogue：
+
+```text
+acc_O register -> sO
+sO TMA store -> O[m_block=7, head_idx, batch]
+```
+
+### 11.5 对较早的 Q block 会怎样
+
+假设：
+
+```text
+m_block = 0
+q_local = 0..127
+q_global = 2048..2175
+```
+
+这个 block 的最大可见 K：
+
+```text
+2175
+```
+
+对应 K block：
+
+```text
+ceil((2175 + 1) / 128) = 17
+```
+
+所以它不会扫满 24 个 blocks，而是只扫到大约：
+
+```text
+n_block_max = 17
+```
+
+这就是 causal LPT scheduler 要优先调度后面 block 的原因：后面 Q blocks 的 K/V mainloop 更长，工作量更大。
+
+## 12. Kernel 的关键设计收益
+
+### 12.1 不 materialize attention matrix
+
+传统 attention：
+
+```text
+S = Q @ K^T
+P = softmax(S)
+O = P @ V
+```
+
+如果完整保存 S/P，内存开销是：
+
+```text
+seqlen_q x seqlen_k
+```
+
+FlashAttention kernel 只在寄存器里处理一个：
+
+```text
+[tile_m, tile_n]
+```
+
+score tile，并在线更新 `acc_O`。
+
+### 12.2 TMA + shared pipeline 隐藏 memory latency
+
+producer 发 TMA：
+
+```text
+global K/V page tile -> shared stage
+```
+
+consumer 等 stage ready 后做 WGMMA。
+
+K/V double buffering：
+
+```text
+stage 0 / stage 1 交替
+```
+
+让 load 和 compute 更容易重叠。
+
+### 12.3 QK/PV intra-warpgroup overlap
+
+开启 `intra_wg_overlap=True` 后：
+
+```text
+QK(next) overlaps PV(current)
+```
+
+这减少 Tensor Core pipeline 空泡。
+
+### 12.4 Register source P
+
+本 case `mma_pv_is_rs=True`：
+
+```text
+S -> online_softmax -> P in register -> PV WGMMA
+```
+
+不需要：
+
+```text
+P register -> shared
+shared -> PV WGMMA
+```
+
+减少 shared memory traffic，也减少一次同步。但对某些 tile/head_dim 组合，register pressure 可能过高，源码会选择 noRS。
+
+### 12.5 causal block skipping + boundary mask
+
+`BlockInfo` 先跳过完全不可见的 K blocks：
+
+```text
+block-level skip
+```
+
+`AttentionMask` 再处理边界 block 内的不可见元素：
+
+```text
+element-level mask
+```
+
+这样既正确，又避免对未来 blocks 做无效 load/compute。
+
+### 12.6 LPT scheduler 降低尾部等待
+
+causal 下后面的 Q blocks 工作量更大。LPT 反转 block 顺序：
+
+```text
+先处理重 blocks，再处理轻 blocks
+```
+
+减少最后少数重 block 拖尾。
+
+## 13. 源码阅读顺序
+
+建议按下面顺序读 kernel：
+
+```text
+1. flash_fwd_sm90.py::kernel
+   看 kernel 参数、pipeline 初始化、producer/consumer 分流。
+
+2. flash_fwd_sm90.py::load
+   看 producer 如何 load Q/K/V，尤其 paged TMA 如何用 page_table。
+
+3. flash_fwd_sm90.py::load_KV
+   看 TMA path 和 cp.async fallback 的分界。
+
+4. flash_fwd_sm90.py::mma
+   看 consumer 如何 partition MMA fragments、创建 softmax 状态、进入 mainloop。
+
+5. flash_fwd_sm90.py::first_half_block_overlap
+   看 overlap path 的启动：QK + softmax + prepare P。
+
+6. flash_fwd_sm90.py::mma_one_n_block_intrawg_overlap
+   看 QK(next) overlap PV(current) 的稳定态。
+
+7. flash_fwd_sm90.py::last_half_block_overlap
+   看最后一个 PV 如何收尾。
+
+8. softmax.py::Softmax.online_softmax / finalize / rescale_O
+   看 online softmax 的数值逻辑。
+
+9. block_info.py::BlockInfo.get_n_block_min_max
+   看 causal/local 怎么裁剪 K/V block range。
+
+10. mask.py::AttentionMask.apply_mask
+   看 tile 内元素级 mask。
+
+11. flash_fwd.py::FlashAttentionForwardBase.epilogue
+   看 acc_O/LSE 如何写回。
+
+12. paged_kv.py::PagedKVManager
+   看 page_size != tile_n 时的 cp.async paged fallback。
+```
+
+## 14. 总结
+
+Hopper FlashAttention forward kernel 可以用一句话概括：
+
+```text
+一个 CTA 处理一个 Q tile / head / batch work tile，
+producer warpgroup 负责把 Q/K/V tile 搬到 shared，
+consumer warpgroups 用 WGMMA 做 QK 和 PV，
+中间用 online softmax 跨 K/V blocks 维护 row_max、row_sum 和 acc_O，
+最后 epilogue 写回 O/LSE。
+```
+
+对 Qwen2.5 风格 case：
+
+```text
+tile_m=128, tile_n=128
+page_size=128
+head_dim=128
+GQA ratio=7
+causal chunked prefill
+```
+
+kernel 的执行形态是：
+
+```text
+1 producer WG:
+    TMA load Q
+    paged TMA load K/V
+    K(next) / V(current) 错位加载
+
+2 consumer WGs:
+    每个 WG 负责 64 Q rows
+    QK WGMMA
+    causal/seqlen mask
+    online softmax
+    P in register
+    PV WGMMA
+    QK(next) overlap PV(current)
 
 epilogue:
-    O accumulator 转 dtype，先写 shared，再 TMA/copy 写 global。
-    LSE 按 Q row 写 global。
+    acc_O normalize
+    optional LSE
+    acc_O -> sO
+    TMA store O
 ```
 
-如果要继续向更底层看，下一步应该追 `sm90_utils_basic.make_trivial_tiled_mma`、`sm90_utils.gemm_zero_init/gemm_w_idx` 和 CuTe 生成的 MLIR/PTX，那里可以看到具体 WGMMA shape 和指令序列。
+这就是 FlashAttention 的 kernel 实现核心：不是单纯把 attention 分块，而是把分块、TMA、WGMMA、mbarrier pipeline、online softmax、寄存器分配、scheduler 和 paged KV 映射组织成一条稳定的 Hopper 执行流水线。
