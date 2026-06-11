@@ -1287,12 +1287,85 @@ K/V tile 只需为这个 CTA 加载一次，然后服务多个 Q heads 的 rows�
 5. 对 MQA 和 decode / KV cache 场景尤其有价值。
 ```
 
+另一个容易被忽略的收益是减少尾 tile 浪费。packed GQA 不是减少数学上的 Q rows 数量，而是改变 `ceil` 取整的粒度。
+
+假设：
+
+```text
+seqlen_q = 257
+tile_m = 128
+nheads_q = 8
+nheads_kv = 2
+qhead_per_kvhead = 4
+```
+
+非 packed 时，每个 Q head 独立沿 sequence 维切 tile：
+
+```text
+每个 Q head 的 m_blocks = ceil(257 / 128) = 3
+总 CTA 数 = nheads_q * 3 = 8 * 3 = 24
+```
+
+最后一个 m_block 对每个 Q head 都只有 1 个真实 token：
+
+```text
+m_block 2: token [256, 257)
+```
+
+因此会产生 8 个很瘦的尾 CTA。它们仍然需要调度、load、mask、softmax/PV 框架和写回，只是有效 M rows 很少。
+
+packed 后，M 维变成：
+
+```text
+packed_m = seqlen_q * qhead_per_kvhead = 257 * 4 = 1028
+```
+
+scheduler 的 head 维从 Q head 变成 KV head：
+
+```text
+每个 KV head 的 packed m_blocks = ceil(1028 / 128) = 9
+总 CTA 数 = nheads_kv * 9 = 2 * 9 = 18
+```
+
+也就是说，4 个共享同一 KV head 的 Q heads 的尾部碎片被合并到同一个 packed M 维里。CTA 容量浪费从：
+
+```text
+非 packed:
+    24 CTA * 128 rows - 8 * 257 rows = 1016 row-slots
+
+packed:
+    18 CTA * 128 rows - 8 * 257 rows = 248 row-slots
+```
+
+这里的 `rows` 指独立的 Q rows，也就是 `(token, q_head)` 对。有效 attention 数学工作仍然是 `8 * 257` 行，没有减少；减少的是尾 tile 空转、CTA 调度数量和围绕 K/V tile 的重复框架开销。
+
+如果 `seqlen_q` 正好整除 `tile_m`，CTA 数不一定减少：
+
+```text
+seqlen_q = 256
+
+非 packed:
+    8 * ceil(256 / 128) = 16
+
+packed:
+    2 * ceil(256 * 4 / 128) = 16
+```
+
+所以 packed GQA 的 CTA 数收益主要来自：
+
+```text
+把每个 Q head 单独 ceil(seqlen / tile_m)，
+变成每个 KV group 统一 ceil(seqlen * qhead_per_kvhead / tile_m)。
+```
+
+在 causal 场景下，这个收益还会体现在尾部和边界 CTA 上：非 packed 时每个 Q head 都有自己的 causal 边界/尾 tile；packed 后，同一 KV group 下多个 Q heads 的边界 rows 会聚合进更少的 packed CTA。
+
 注意：
 
 ```text
 packed GQA 不减少 QK/PV 的数学计算总量。
 每个 Q head 仍然要算自己的 attention。
-它减少的是重复 K/V 读取、producer 工作和 head 维调度碎片。
+它减少的是重复 K/V 读取、producer 工作、尾 tile 空转和 head 维调度碎片。
 ```
 
 ### 5.9 packed GQA 的代价和限制
