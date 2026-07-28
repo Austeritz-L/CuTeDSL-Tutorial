@@ -18,6 +18,7 @@ Layout algebra
 2. [Copy Atom and Tiled Copy](02_copy_atom_tiledcopy.md)
 3. [MMA Atom and Tiled MMA](03_mma_atom_tiledmma.md)
 4. [128x128x16 LDSM TensorOp GEMM Walkthrough](04_ldsm_tensorop_kernel_walkthrough.md)
+5. [Blackwell FlashAttention-4 Forward: Layout、TMEM 与异步流水](flash-attention/blackwell_flash_attention_4_forward.md)
 
 ## Local Source Map
 
